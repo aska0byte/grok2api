@@ -59,6 +59,18 @@ func (r *qualityLeaseAccountRepository) ListEgressBindingProviders(context.Conte
 func (r *qualityLeaseAccountRepository) ListEgressSourceBindingProviders(context.Context, uint64) ([]accountdomain.Provider, error) {
 	return []accountdomain.Provider{}, nil
 }
+func (r *qualityLeaseAccountRepository) GetAccountEgressNodeID(_ context.Context, id uint64) (uint64, error) {
+	if id != r.credential.ID {
+		return 0, repository.ErrNotFound
+	}
+	return r.credential.EgressNodeID, nil
+}
+func (r *qualityLeaseAccountRepository) ListEgressAccountsByNode(context.Context, uint64) ([]accountdomain.Credential, error) {
+	if r.credential.EgressNodeID == 0 {
+		return []accountdomain.Credential{}, nil
+	}
+	return []accountdomain.Credential{r.credential}, nil
+}
 func (r *qualityLeaseAccountRepository) Get(_ context.Context, id uint64) (accountdomain.Credential, error) {
 	if id != r.credential.ID {
 		return accountdomain.Credential{}, repository.ErrNotFound

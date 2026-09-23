@@ -282,6 +282,8 @@ type Selector struct {
 	capacityWait           time.Duration
 	preferFreeBuild        bool
 	excludeBuildBotFlagged bool
+	buildBoundOnlyEnabled  bool
+	buildBoundOnlyCacheUntil time.Time
 	segmentedConfig        segmentedSelectorConfig
 	segmentedState         segmentedSelectorState
 	configMu               sync.RWMutex
@@ -386,6 +388,41 @@ func (s *Selector) excludeBuildBotFlaggedEnabled() bool {
 	s.configMu.RLock()
 	defer s.configMu.RUnlock()
 	return s.excludeBuildBotFlagged
+}
+
+// buildBoundOnlyRouting keeps ordinary Build inference on accounts explicitly
+// bound to a long-lived (production) egress node, so an unbound account never
+// serves traffic once the deployment has at least one usable production node.
+// With no usable production node configured (legacy direct-egress setups) the
+// restriction disarms: no account could ever bind and filtering would strand
+// the whole pool. Pinned and quality-probe paths bypass this check so an
+// operator can still audit unbound accounts.
+func (s *Selector) buildBoundOnlyRouting(ctx context.Context, provider account.Provider, now time.Time) bool {
+	if provider != account.ProviderBuild {
+		return false
+	}
+	s.configMu.RLock()
+	if s.buildBoundOnlyCacheUntil.After(now) {
+		enabled := s.buildBoundOnlyEnabled
+		s.configMu.RUnlock()
+		return enabled
+	}
+	s.configMu.RUnlock()
+	probe, probeOK := s.accounts.(repository.ProductionEgressUsageRepository)
+	if !probeOK {
+		return false
+	}
+	usable, err := probe.CountUsableProductionEgressNodes(ctx)
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	if err != nil {
+		s.buildBoundOnlyCacheUntil = now.Add(10 * time.Second)
+		s.buildBoundOnlyEnabled = false
+		return false
+	}
+	s.buildBoundOnlyEnabled = usable > 0
+	s.buildBoundOnlyCacheUntil = now.Add(30 * time.Second)
+	return s.buildBoundOnlyEnabled
 }
 
 func (s *Selector) invalidateProviderCandidateCache(provider account.Provider) {
@@ -499,6 +536,12 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	}
 	quotaConsumed := s.quotaConsumptionSnapshot(provider)
 	healthOverrides := s.routingHealthSnapshot(provider, now)
+	// 普通推理路径的 Build 账号必须绑定长效（production）出口节点；pinned 与
+	// 质量探测路径不经过此过滤，保证运维仍能审计未绑定账号。
+	buildBoundOnly := false
+	if !pinned {
+		buildBoundOnly = s.buildBoundOnlyRouting(ctx, provider, now)
+	}
 	// 仅保留候选下标，避免每个请求复制包含凭据、计费和额度结构的完整账号切片。
 	normalCandidates := make([]int, 0, len(values))
 	probeCandidates := make([]int, 0, len(values))
@@ -534,6 +577,9 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 		if !pinned && candidate.ModelQuotaBlock != nil && now.Before(candidate.ModelQuotaBlock.CooldownUntil) {
 			modelCoolingCandidates++
 			earliestRetry = earlierFuture(earliestRetry, candidate.ModelQuotaBlock.CooldownUntil, now)
+			continue
+		}
+		if buildBoundOnly && value.EgressNodeID == 0 {
 			continue
 		}
 		if forcedAccountID == 0 && candidateEgressLeaseCooling(candidate, value, now) {

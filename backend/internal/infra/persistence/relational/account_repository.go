@@ -598,7 +598,9 @@ func (r *AccountRepository) getRoutingEgressLeaseBlocks(ctx context.Context, pro
 
 // listRoutingCredentials loads only the account state required to decide which
 // account to use. Provider secrets deliberately stay in account_credentials
-// until a selected account is hydrated for the upstream call.
+// until a selected account is hydrated for the upstream call. The
+// build-bound-only routing restriction is enforced by the gateway selector on
+// the ordinary inference path; pinned/probe paths intentionally bypass it.
 func (r *AccountRepository) listRoutingCredentials(ctx context.Context, provider account.Provider) ([]account.Credential, error) {
 	rows, err := r.listActiveProviderAccountRows(ctx, provider, routingCredentialMetadataColumns)
 	if err != nil {
@@ -611,36 +613,20 @@ func (r *AccountRepository) listRoutingCredentials(ctx context.Context, provider
 	if err := r.attachRoutingEgressIdentities(ctx, provider, values); err != nil {
 		return nil, err
 	}
-	return r.filterBuildBoundRoutingCredentials(ctx, provider, values)
+	return values, nil
 }
 
-// filterBuildBoundRoutingCredentials keeps ordinary Build inference on
-// accounts explicitly bound to a long-lived (production) egress node, so an
-// account without a binding never serves traffic. The restriction only arms
-// once the deployment has at least one usable production node: with none
-// configured (legacy direct-egress setups) no account could ever bind and
-// filtering would strand the whole pool.
-func (r *AccountRepository) filterBuildBoundRoutingCredentials(ctx context.Context, provider account.Provider, values []account.Credential) ([]account.Credential, error) {
-	if provider != account.ProviderBuild || len(values) == 0 {
-		return values, nil
-	}
+// CountUsableProductionEgressNodes reports how many enabled, proxy-configured
+// production egress nodes exist. The gateway arms the build-bound-only routing
+// restriction only while this count is positive.
+func (r *AccountRepository) CountUsableProductionEgressNodes(ctx context.Context) (int64, error) {
 	var usable int64
 	if err := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).
 		Where("usage = ? AND enabled = ? AND encrypted_proxy_url <> ''", "production", true).
 		Limit(1).Count(&usable).Error; err != nil {
-		return nil, err
+		return 0, err
 	}
-	if usable == 0 {
-		return values, nil
-	}
-	filtered := make([]account.Credential, 0, len(values))
-	for _, value := range values {
-		if value.EgressNodeID == 0 {
-			continue
-		}
-		filtered = append(filtered, value)
-	}
-	return filtered, nil
+	return usable, nil
 }
 
 // listActiveProviderAccountRows avoids GORM association preloads for complete
