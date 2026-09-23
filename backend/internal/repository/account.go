@@ -89,6 +89,12 @@ type RoutingLayerRepository interface {
 	ListRoutingAccountOverlays(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel string) (account.RoutingOverlaySnapshot, error)
 }
 
+// ProbeCandidateRepository loads a single account for operator quality probes
+// without the ordinary scheduling filters; optional repository capability.
+type ProbeCandidateRepository interface {
+	ListRoutingCandidateForProbe(ctx context.Context, provider account.Provider, accountID uint64) (account.RoutingCandidate, bool, error)
+}
+
 // AccountRepository 定义 OAuth 账号和额度快照持久化能力。
 type AccountRepository interface {
 	List(ctx context.Context, query AccountListQuery) ([]account.Credential, int64, error)
@@ -116,6 +122,8 @@ type AccountRepository interface {
 	HasActive(ctx context.Context, provider account.Provider) (bool, error)
 	ListRoutingCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error)
 	GetCredentialMaterial(ctx context.Context, accountID uint64, provider account.Provider) (account.CredentialMaterial, error)
+	// GetCredentialMaterialForProbe 钉定探测专用：不做 enabled/auth 过滤。
+	GetCredentialMaterialForProbe(ctx context.Context, accountID uint64, provider account.Provider) (account.CredentialMaterial, error)
 	Get(ctx context.Context, id uint64) (account.Credential, error)
 	LinkWebToBuild(ctx context.Context, webAccountID, buildAccountID uint64) error
 	GetBillings(ctx context.Context, accountIDs []uint64) (map[uint64]account.Billing, error)
@@ -181,4 +189,15 @@ type AccountRepository interface {
 	ListDueQuotaWindows(ctx context.Context, now time.Time, limit int) ([]account.QuotaWindow, error)
 	ListQuotaRecoveryWindows(ctx context.Context, limit int) ([]account.QuotaWindow, error)
 	ListStaleWebQuotaAccountIDs(ctx context.Context, before time.Time, limit int) ([]uint64, error)
+	// UpdateEgressBindings rewrites the long-lived egress binding rows for the
+	// given accounts; a nil nodeID clears (releases) the binding.
+	UpdateEgressBindings(ctx context.Context, provider account.Provider, ids []uint64, nodeID *uint64, mode account.EgressAssignmentMode, assignedAt time.Time) (int64, error)
+	// ListMissingThinkingStrikes returns enabled Build accounts currently on a
+	// missing-thinking strike (cooled or previously disabled but re-enabled),
+	// so the probe scheduler can re-test them.
+	ListMissingThinkingStrikes(ctx context.Context, now time.Time, limit int) ([]account.Credential, error)
+	// ListEgressBoundAccounts returns enabled Build accounts bound to a usable
+	// long-lived (production) egress node, for the account quality probe's
+	// full-rotation candidate source. Credentials carry EgressNodeID.
+	ListEgressBoundAccounts(ctx context.Context, limit int) ([]account.Credential, error)
 }

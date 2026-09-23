@@ -1555,6 +1555,113 @@ func TestMarkMissingThinkingCoolsThenDisables(t *testing.T) {
 	}
 }
 
+func TestMarkAccountCoolingPreservesStrikeHistory(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "account-cooling.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "cooling", SourceKey: "cooling", EncryptedAccessToken: "encrypted", Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 500*time.Millisecond)
+	if action, err := selector.markMissingThinking(ctx, credential, time.Hour); err != nil || action != missingThinkingPenaltyCooled {
+		t.Fatalf("strike setup = (%s, %v)", action, err)
+	}
+	before := time.Now().UTC()
+	if err := selector.MarkAccountCooling(ctx, account.ProviderBuild, credential.ID, 6*time.Hour); err != nil {
+		t.Fatalf("MarkAccountCooling = %v", err)
+	}
+	cooled, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cooled.Enabled || cooled.LastError != lastErrorMissingThinking || cooled.CooldownUntil == nil {
+		t.Fatalf("isolation must keep strike marker and enable state, got %#v", cooled)
+	}
+	if wait := cooled.CooldownUntil.Sub(before); wait < 5*time.Hour+50*time.Minute || wait > 6*time.Hour+10*time.Minute {
+		t.Fatalf("isolation cooldown = %s", wait)
+	}
+	if err := selector.MarkAccountCooling(ctx, account.ProviderBuild, credential.ID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	kept, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !kept.CooldownUntil.Equal(*cooled.CooldownUntil) {
+		t.Fatalf("shorter isolation must not shorten an existing cooldown: %v -> %v", cooled.CooldownUntil, kept.CooldownUntil)
+	}
+	if err := selector.MarkAccountCooling(ctx, account.ProviderConsole, credential.ID, time.Hour); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("provider mismatch error = %v", err)
+	}
+}
+
+func TestRestoreAccountClearsHealthAndReenables(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "account-restore.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "restore", SourceKey: "restore", EncryptedAccessToken: "encrypted", Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 500*time.Millisecond)
+	if action, err := selector.markMissingThinking(ctx, credential, time.Hour); err != nil || action != missingThinkingPenaltyCooled {
+		t.Fatalf("first strike = (%s, %v)", action, err)
+	}
+	expired := time.Now().UTC().Add(-time.Second)
+	cooled, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cooled.CooldownUntil = &expired
+	if action, err := selector.markMissingThinking(ctx, cooled, time.Hour); err != nil || action != missingThinkingPenaltyDisabled {
+		t.Fatalf("second strike = (%s, %v)", action, err)
+	}
+	disabled, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.Enabled || disabled.LastError != lastErrorMissingThinkingDisabled {
+		t.Fatalf("strike machine state = %#v", disabled)
+	}
+	if err := selector.RestoreAccount(ctx, account.ProviderBuild, credential.ID); err != nil {
+		t.Fatalf("RestoreAccount = %v", err)
+	}
+	restored, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.Enabled || restored.LastError != "" || restored.CooldownUntil != nil || restored.FailureCount != 0 {
+		t.Fatalf("restore must re-enable and clear health, got %#v", restored)
+	}
+	if err := selector.RestoreAccount(ctx, account.ProviderBuild, credential.ID); err != nil {
+		t.Fatalf("restore on healthy account = %v", err)
+	}
+	if err := selector.RestoreAccount(ctx, account.ProviderConsole, credential.ID); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("provider mismatch error = %v", err)
+	}
+}
+
 func TestMarkFailureSoftNetworkCooldown(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "soft-network.db"))

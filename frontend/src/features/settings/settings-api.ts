@@ -1,5 +1,5 @@
 import { apiRequest } from "@/shared/api/client";
-import { createObjectDecoder, decodeBooleanResult, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isRecordOf, isString } from "@/shared/api/decoder";
+import { createObjectDecoder, createValidatedDecoder, decodeBooleanResult, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isRecordOf, isString } from "@/shared/api/decoder";
 import type { SortOrder } from "@/shared/lib/table-sort";
 
 export type SettingsConfigDTO = {
@@ -38,9 +38,10 @@ export type SettingsConfigDTO = {
 };
 
 export type ClearanceMode = "manual" | "flaresolverr" | "on_demand";
+export type EgressUsage = "production" | "probe";
 
 export type EgressNodeDTO = {
-	id: string; name: string; scope: EgressScope; enabled: boolean;
+	id: string; name: string; scope: EgressScope; enabled: boolean; usage: EgressUsage;
 	proxyConfigured: boolean; proxyDisplay?: string; proxyFingerprint?: string; userAgent: string; cookieConfigured: boolean;
 	accountBoundProxy: boolean; proxyPool: boolean; proxyProfileId?: string; proxyProfileName?: string;
 	sourceId?: string; accountCapacity: number; assignedAccountCount: number;
@@ -51,7 +52,7 @@ export type EgressNodeDTO = {
 };
 
 export type EgressNodeInput = {
-	name: string; scope: EgressScope; enabled: boolean; proxyPool: boolean; proxyURL?: string;
+	name: string; scope: EgressScope; enabled: boolean; usage?: EgressUsage; proxyPool: boolean; proxyURL?: string;
 	proxyProfileId?: string;
 	accountCapacity: number; clearProxyURL?: boolean; userAgent: string; cloudflareCookies?: string; clearCookies?: boolean;
 };
@@ -97,13 +98,16 @@ export type EgressSourceInput = {
 };
 export type EgressOperationsConfigDTO = {
   probeProvider: "ipinfo" | "cloudflare"; probeIntervalSeconds: number; autoAssignEnabled: boolean; autoBalanceEnabled: boolean;
-  assignmentIntervalSeconds: number; fallbacks: Record<EgressScope, EgressFallbackConfigDTO>; updatedAt: string;
+  assignmentIntervalSeconds: number; probeNodeLimit: number; fallbacks: Record<EgressScope, EgressFallbackConfigDTO>; updatedAt: string;
 };
-export type EgressImportResultDTO = { imported: number; skipped: number };
+export type EgressImportResultDTO = { imported: number; skipped: number; replaced: number };
 export type EgressIPProbeDTO = { status: "unknown" | "healthy" | "unhealthy"; testedAt?: string; latencyMs: number; exitIp?: string; error?: string };
 export type EgressProbeResultDTO = { status: "unknown" | "healthy" | "unhealthy"; testedAt: string; latencyMs: number; exitIp?: string; error?: string; probeProvider?: "ipinfo" | "cloudflare"; ipv4: EgressIPProbeDTO; ipv6: EgressIPProbeDTO };
 export type EgressProbeBatchResultDTO = { requested: number; healthy: number; unhealthy: number };
-export type EgressRebalanceResultDTO = { assigned: number; rebalanced: number; unplaced: number };
+export type EgressRebalanceNodeStatsDTO = { total: number; healthy: number; unprobed: number; unhealthy: number; cooldown: number; disabled: number };
+export type EgressRebalanceResultDTO = { assigned: number; rebalanced: number; unplaced: number; released: number; nodes: EgressRebalanceNodeStatsDTO };
+export type EgressNodeAccountDTO = { id: number; provider: string; name: string; email?: string; enabled: boolean; authStatus: string; assignmentMode: string };
+export type EgressNodeAccountsDTO = { accounts: EgressNodeAccountDTO[] };
 export type EgressUnhealthyCleanupPreviewDTO = { nodes: number; boundAccounts: number; subscriptionManaged: number };
 
 export type SettingsSnapshotDTO = {
@@ -206,15 +210,17 @@ const decodeSettingsSnapshot = (value: unknown) => withSettingsDefaults(decodeSe
 const egressIPProbeValidator = hasShape({
   status: isOneOf("unknown", "healthy", "unhealthy"), testedAt: isOptional(isString), latencyMs: isNumber, exitIp: isOptional(isString), error: isOptional(isString),
 });
-type EgressNodeWireDTO = Omit<EgressNodeDTO, "ipv4Probe" | "ipv6Probe"> & { ipv4Probe?: EgressIPProbeDTO; ipv6Probe?: EgressIPProbeDTO };
+type EgressNodeWireDTO = Omit<EgressNodeDTO, "ipv4Probe" | "ipv6Probe" | "usage"> & { ipv4Probe?: EgressIPProbeDTO; ipv6Probe?: EgressIPProbeDTO; usage?: EgressUsage };
 type EgressSourceWireDTO = Omit<EgressSourceDTO, "proxyConfigured"> & { proxyConfigured?: boolean };
-type EgressOperationsConfigWireDTO = Omit<EgressOperationsConfigDTO, "probeProvider"> & {
+type EgressOperationsConfigWireDTO = Omit<EgressOperationsConfigDTO, "probeProvider" | "probeNodeLimit"> & {
   probeProvider?: "ipinfo" | "cloudflare";
+  probeNodeLimit?: number;
 };
 type EgressProbeResultWireDTO = Omit<EgressProbeResultDTO, "ipv4" | "ipv6"> & { ipv4?: EgressIPProbeDTO; ipv6?: EgressIPProbeDTO };
 const unknownEgressIPProbe = (): EgressIPProbeDTO => ({ status: "unknown", latencyMs: 0 });
 const withEgressNodeProbeDefaults = (value: EgressNodeWireDTO): EgressNodeDTO => ({
   ...value,
+  usage: value.usage ?? "production",
   ipv4Probe: value.ipv4Probe ?? unknownEgressIPProbe(),
   ipv6Probe: value.ipv6Probe ?? unknownEgressIPProbe(),
 });
@@ -224,6 +230,7 @@ const withEgressSourceDefaults = (value: EgressSourceWireDTO): EgressSourceDTO =
 });
 const egressNodeValidator = hasShape({
   id: isString, name: isString, scope: isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset", "grok_console_asset"), enabled: isBoolean,
+  usage: isOptional(isOneOf("production", "probe")),
   proxyConfigured: isBoolean, proxyDisplay: isOptional(isString), proxyFingerprint: isOptional(isString), userAgent: isString, cookieConfigured: isBoolean, accountBoundProxy: isBoolean, proxyPool: isBoolean, health: isNumber, failureCount: isNumber,
   sourceId: isOptional(isString), proxyProfileId: isOptional(isString), proxyProfileName: isOptional(isString), accountCapacity: isNumber, assignedAccountCount: isNumber,
   probeStatus: isOneOf("unknown", "healthy", "unhealthy"), lastProbedAt: isOptional(isString), probeLatencyMs: isNumber, exitIp: isOptional(isString), probeError: isOptional(isString), probeProvider: isOptional(isOneOf("ipinfo", "cloudflare")),
@@ -232,6 +239,7 @@ const egressNodeValidator = hasShape({
 });
 const decodeEgressNodeRaw = createObjectDecoder<EgressNodeWireDTO>("egress node", {
   id: isString, name: isString, scope: isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset", "grok_console_asset"), enabled: isBoolean,
+  usage: isOptional(isOneOf("production", "probe")),
   proxyConfigured: isBoolean, proxyDisplay: isOptional(isString), proxyFingerprint: isOptional(isString), userAgent: isString, cookieConfigured: isBoolean, accountBoundProxy: isBoolean, proxyPool: isBoolean, health: isNumber, failureCount: isNumber,
   sourceId: isOptional(isString), proxyProfileId: isOptional(isString), proxyProfileName: isOptional(isString), accountCapacity: isNumber, assignedAccountCount: isNumber,
   probeStatus: isOneOf("unknown", "healthy", "unhealthy"), lastProbedAt: isOptional(isString), probeLatencyMs: isNumber, exitIp: isOptional(isString), probeError: isOptional(isString), probeProvider: isOptional(isOneOf("ipinfo", "cloudflare")),
@@ -307,17 +315,23 @@ const decodeEgressSourceList = (value: unknown): EgressSourceListDTO => {
     total: decoded.total ?? decoded.items.length,
   };
 };
-const decodeEgressImportResult = createObjectDecoder<EgressImportResultDTO>("egress import result", { imported: isNumber, skipped: isNumber });
+const decodeEgressImportResult = createObjectDecoder<EgressImportResultDTO>("egress import result", { imported: isNumber, skipped: isNumber, replaced: isOptional(isNumber) });
+const withEgressImportResultDefaults = (value: { imported: number; skipped: number; replaced?: number }): EgressImportResultDTO => ({ imported: value.imported, skipped: value.skipped, replaced: value.replaced ?? 0 });
 const decodeEgressProbeBatchResult = createObjectDecoder<EgressProbeBatchResultDTO>("egress probe result", { requested: isNumber, healthy: isNumber, unhealthy: isNumber });
-const decodeEgressRebalanceResult = createObjectDecoder<EgressRebalanceResultDTO>("egress rebalance result", { assigned: isNumber, rebalanced: isNumber, unplaced: isNumber });
+const decodeEgressRebalanceResult = createObjectDecoder<EgressRebalanceResultDTO>("egress rebalance result", { assigned: isNumber, rebalanced: isNumber, unplaced: isNumber, released: isOptional(isNumber), nodes: isOptional(hasShape({ total: isNumber, healthy: isNumber, unprobed: isNumber, unhealthy: isNumber, cooldown: isNumber, disabled: isNumber })) });
+const withEgressRebalanceDefaults = (value: { assigned: number; rebalanced: number; unplaced: number; released?: number; nodes?: EgressRebalanceNodeStatsDTO }): EgressRebalanceResultDTO => ({
+  assigned: value.assigned, rebalanced: value.rebalanced, unplaced: value.unplaced, released: value.released ?? 0,
+  nodes: value.nodes ?? { total: 0, healthy: 0, unprobed: 0, unhealthy: 0, cooldown: 0, disabled: 0 },
+});
 const egressFallbackConfigValidator = hasShape({ mode: isOneOf("none", "direct", "fixed"), nodeId: isOptional(isString) });
 const decodeEgressOperationsConfigRaw = createObjectDecoder<EgressOperationsConfigWireDTO>("egress operations config", {
   probeProvider: isOptional(isOneOf("ipinfo", "cloudflare")), probeIntervalSeconds: isNumber, autoAssignEnabled: isBoolean, autoBalanceEnabled: isBoolean, assignmentIntervalSeconds: isNumber,
+  probeNodeLimit: isOptional(isNumber),
   fallbacks: isRecordOf(egressFallbackConfigValidator), updatedAt: isString,
 });
 const decodeEgressOperationsConfig = (value: unknown): EgressOperationsConfigDTO => {
   const decoded = decodeEgressOperationsConfigRaw(value);
-  return { ...decoded, probeProvider: decoded.probeProvider ?? "cloudflare" };
+  return { ...decoded, probeProvider: decoded.probeProvider ?? "cloudflare", probeNodeLimit: decoded.probeNodeLimit ?? 100 };
 };
 const decodeEgressProbeResultRaw = createObjectDecoder<EgressProbeResultWireDTO>("egress probe", {
   status: isOneOf("unknown", "healthy", "unhealthy"), testedAt: isString, latencyMs: isNumber, exitIp: isOptional(isString), error: isOptional(isString), probeProvider: isOptional(isOneOf("ipinfo", "cloudflare")),
@@ -342,6 +356,7 @@ type ListEgressNodesInput = {
   search?: string;
   scope?: EgressScope | "";
   enabled?: string;
+  usage?: EgressUsage | "";
   probe?: string;
   assignment?: string;
   sortBy?: string;
@@ -353,6 +368,7 @@ export function listEgressNodes(input: ListEgressNodesInput = {}): Promise<Egres
   if (input.search) query.set("search", input.search);
   if (input.scope) query.set("scope", input.scope);
   if (input.enabled) query.set("enabled", input.enabled);
+  if (input.usage) query.set("usage", input.usage);
   if (input.probe) query.set("probe", input.probe);
   if (input.assignment) query.set("assignment", input.assignment);
   if (input.sortBy && input.sortOrder) {
@@ -474,11 +490,11 @@ export function deleteEgressSource(id: string): Promise<{ deleted: boolean }> {
 }
 
 export function syncEgressSource(id: string): Promise<EgressImportResultDTO> {
-  return apiRequest(`/api/admin/v1/egress-sources/${id}/sync`, { method: "POST" }, decodeEgressImportResult);
+  return apiRequest(`/api/admin/v1/egress-sources/${id}/sync`, { method: "POST" }, (value) => withEgressImportResultDefaults(decodeEgressImportResult(value)));
 }
 
-export function importEgressText(input: { name: string; scope: EgressScope; accountCapacity: number; content: string }): Promise<EgressImportResultDTO> {
-  return apiRequest("/api/admin/v1/egress-imports", { method: "POST", body: input }, decodeEgressImportResult);
+export function importEgressText(input: { name: string; scope: EgressScope; accountCapacity: number; usage?: EgressUsage; content: string }): Promise<EgressImportResultDTO> {
+  return apiRequest("/api/admin/v1/egress-imports", { method: "POST", body: input }, (value) => withEgressImportResultDefaults(decodeEgressImportResult(value)));
 }
 
 export function getEgressOperationsConfig(): Promise<EgressOperationsConfigDTO> {
@@ -490,7 +506,48 @@ export function updateEgressOperationsConfig(input: Omit<EgressOperationsConfigD
 }
 
 export function rebalanceEgressAccounts(): Promise<EgressRebalanceResultDTO> {
-  return apiRequest("/api/admin/v1/egress-operations/rebalance", { method: "POST" }, decodeEgressRebalanceResult);
+  return apiRequest("/api/admin/v1/egress-operations/rebalance", { method: "POST" }, (value) => withEgressRebalanceDefaults(decodeEgressRebalanceResult(value)));
+}
+
+const decodeEgressNodeAccounts = createObjectDecoder<EgressNodeAccountsDTO>("egress node accounts", {
+  accounts: isArrayOf(hasShape({ id: isNumber, provider: isString, name: isString, email: isOptional(isString), enabled: isBoolean, authStatus: isString, assignmentMode: isString })),
+});
+
+export function listEgressNodeAccounts(nodeID: string): Promise<EgressNodeAccountsDTO> {
+  return apiRequest(`/api/admin/v1/egress-operations/nodes/${encodeURIComponent(nodeID)}/accounts`, { method: "GET" }, decodeEgressNodeAccounts);
+}
+
+export type AccountQualityProbeConfirmationDTO = {
+  requestId: string; nodeId: string; statusCode: number;
+  firstTokenMs: number; durationMs: number; outputTokens: number; reasoningTokens: number;
+  visibleCharacters: number; outputTokensPerSecond: number;
+  thinkingObserved: boolean; missingThinking: boolean;
+};
+
+export type AccountQualityProbeResultDTO = {
+  requestId: string; accountId: string; nodeId: string; model: string; kind?: string; statusCode: number;
+  firstTokenMs: number; durationMs: number; outputTokens: number; reasoningTokens: number;
+  visibleCharacters: number; outputTokensPerSecond: number;
+  thinkingObserved: boolean; missingThinking: boolean; action: string;
+  overturned?: boolean;
+  confirmation?: AccountQualityProbeConfirmationDTO | null;
+};
+
+export function probeAccountQuality(accountID: string, input: { clientKeyID?: string; model?: string; prompt?: string; maxOutputTokens?: number; kind?: string } = {}): Promise<AccountQualityProbeResultDTO> {
+  return apiRequest(`/api/admin/v1/egress-operations/accounts/${accountID}/quality-probe`, { method: "POST", body: input }, createObjectDecoder<AccountQualityProbeResultDTO>("account quality probe", {
+    requestId: isString, accountId: isString, nodeId: isString, model: isString, statusCode: isNumber,
+    kind: isOptional(isString),
+    firstTokenMs: isNumber, durationMs: isNumber, outputTokens: isNumber, reasoningTokens: isNumber,
+    visibleCharacters: isNumber, outputTokensPerSecond: isNumber,
+    thinkingObserved: isBoolean, missingThinking: isBoolean, action: isString,
+    overturned: isOptional(isBoolean),
+    confirmation: isOptional(hasShape({
+      requestId: isString, nodeId: isString, statusCode: isNumber,
+      firstTokenMs: isNumber, durationMs: isNumber, outputTokens: isNumber, reasoningTokens: isNumber,
+      visibleCharacters: isNumber, outputTokensPerSecond: isNumber,
+      thinkingObserved: isBoolean, missingThinking: isBoolean,
+    })),
+  }));
 }
 
 export function assignEgressAccounts(nodeID: string, provider: "grok_build" | "grok_web" | "grok_console", ids: string[], mode: "manual" | "auto" = "manual"): Promise<{ assigned: number }> {
@@ -499,4 +556,82 @@ export function assignEgressAccounts(nodeID: string, provider: "grok_build" | "g
 
 export function unassignEgressAccounts(provider: "grok_build" | "grok_web" | "grok_console", ids: string[]): Promise<{ assigned: number }> {
   return apiRequest("/api/admin/v1/egress-nodes/accounts", { method: "DELETE", body: { provider, ids } }, createObjectDecoder<{ assigned: number }>("egress account assignment", { assigned: isNumber }));
+}
+
+export type ProbeSampleDTO = {
+  id: string; requestId: string; source: string; round: number; kind: string;
+  accountId: string; accountName: string; egressNodeId: string; egressNodeName: string;
+  model: string; classification: string; action?: string; manualFlag?: string;
+  missingThinking: boolean; thinkingObserved: boolean;
+  visiblePreview: string; visibleLength: number; reasoningLength: number;
+  outputTokens: number; reasoningTokens: number;
+  firstTokenMs: number; durationMs: number; outputTokensPerSecond: number; createdAt: string;
+};
+
+export type ProbeSampleDetailDTO = ProbeSampleDTO & {
+  visibleText: string; visibleTruncated: boolean;
+  reasoningText: string; reasoningTruncated: boolean;
+};
+
+export type ProbeSampleListDTO = { items: ProbeSampleDTO[]; total: number; page: number; pageSize: number };
+
+const decodeProbeSample = hasShape({
+  id: isString, requestId: isString, source: isString, round: isNumber, kind: isString,
+  accountId: isString, accountName: isString, egressNodeId: isString, egressNodeName: isString,
+  model: isString, classification: isString, action: isOptional(isString), manualFlag: isOptional(isString),
+  missingThinking: isBoolean, thinkingObserved: isBoolean,
+  visiblePreview: isString, visibleLength: isNumber, reasoningLength: isNumber,
+  outputTokens: isNumber, reasoningTokens: isNumber,
+  firstTokenMs: isNumber, durationMs: isNumber, outputTokensPerSecond: isNumber, createdAt: isString,
+});
+
+export function listProbeSamples(input: { page?: number; pageSize?: number; classification?: string; kind?: string; manualFlag?: string; search?: string; accountId?: string } = {}): Promise<ProbeSampleListDTO> {
+  const params = new URLSearchParams();
+  if (input.page && input.page > 1) params.set("page", String(input.page));
+  if (input.pageSize && input.pageSize !== 20) params.set("pageSize", String(input.pageSize));
+  if (input.classification) params.set("classification", input.classification);
+  if (input.kind) params.set("kind", input.kind);
+  if (input.manualFlag) params.set("manualFlag", input.manualFlag);
+  if (input.search) params.set("search", input.search);
+  if (input.accountId) params.set("accountId", input.accountId);
+  const query = params.toString();
+  return apiRequest(`/api/admin/v1/quality-guard/probe-samples${query ? `?${query}` : ""}`, { method: "GET" }, createObjectDecoder<ProbeSampleListDTO>("probe samples", {
+    items: isArrayOf(decodeProbeSample), total: isNumber, page: isNumber, pageSize: isNumber,
+  }));
+}
+
+export function getProbeSample(id: string): Promise<ProbeSampleDetailDTO> {
+  return apiRequest(`/api/admin/v1/quality-guard/probe-samples/${encodeURIComponent(id)}`, { method: "GET" }, createObjectDecoder<ProbeSampleDetailDTO>("probe sample", {
+    ...decodeProbeSample,
+    visibleText: isString, visibleTruncated: isBoolean, reasoningText: isString, reasoningTruncated: isBoolean,
+  }));
+}
+
+export function markProbeSample(id: string, flag: "" | "suspected" | "normal"): Promise<ProbeSampleDTO> {
+  return apiRequest(`/api/admin/v1/quality-guard/probe-samples/${encodeURIComponent(id)}/manual-flag`, { method: "POST", body: { flag } }, createValidatedDecoder<ProbeSampleDTO>("probe sample mark", decodeProbeSample));
+}
+
+export function markProbeSamples(ids: string[], flag: "" | "suspected" | "normal"): Promise<{ updated: number }> {
+  return apiRequest("/api/admin/v1/quality-guard/probe-samples/manual-flag", { method: "POST", body: { ids, flag } }, createObjectDecoder<{ updated: number }>("probe samples batch mark", { updated: isNumber }));
+}
+
+export function deleteProbeSample(id: string): Promise<{ deleted: number }> {
+  return apiRequest(`/api/admin/v1/quality-guard/probe-samples/${encodeURIComponent(id)}`, { method: "DELETE" }, createObjectDecoder<{ deleted: number }>("probe sample delete", { deleted: isNumber }));
+}
+
+export function deleteProbeSamples(ids: string[]): Promise<{ deleted: number }> {
+  return apiRequest("/api/admin/v1/quality-guard/probe-samples", { method: "DELETE", body: { ids } }, createObjectDecoder<{ deleted: number }>("probe samples delete", { deleted: isNumber }));
+}
+
+export function quarantineProbeSampleAccount(accountId: string, hours: number): Promise<{ quarantined: boolean }> {
+  return apiRequest(`/api/admin/v1/egress-operations/accounts/${encodeURIComponent(accountId)}/quarantine`, { method: "POST", body: { hours } }, createObjectDecoder<{ quarantined: boolean }>("account quarantine", { quarantined: isBoolean }));
+}
+
+export function quarantineProbeSampleAccounts(accountIds: string[], hours: number): Promise<{ quarantined: number[]; missing: number[] }> {
+  const ids = accountIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0);
+  return apiRequest("/api/admin/v1/egress-operations/account-controls/quarantine", { method: "POST", body: { accountIds: ids, hours } }, createObjectDecoder<{ quarantined: number[]; missing: number[] }>("account batch quarantine", { quarantined: isArrayOf(isNumber), missing: isArrayOf(isNumber) }));
+}
+
+export function restoreProbeSampleAccount(accountId: string): Promise<{ restored: boolean }> {
+  return apiRequest(`/api/admin/v1/egress-operations/accounts/${encodeURIComponent(accountId)}/restore`, { method: "POST" }, createObjectDecoder<{ restored: boolean }>("account restore", { restored: isBoolean }));
 }

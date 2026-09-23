@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	auditdomain "github.com/chenyme/grok2api/backend/internal/domain/audit"
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
@@ -25,6 +27,7 @@ var (
 	ErrProbeStale              = errors.New("代理配置在探测期间已更新，请重新测试")
 	ErrQualityProbeUnavailable = errors.New("出口质量探测不可用")
 	ErrQualityProbeNoAccount   = errors.New("质量检测暂无可调度账号")
+	ErrAccountControlUnavailable = errors.New("账号操作能力未接入")
 	ErrClearanceUnavailable    = errors.New("Clearance 刷新不可用")
 	ErrProxyProfileUnavailable = errors.New("共享代理配置功能不可用")
 	ErrProxyProfileInUse       = errors.New("共享代理配置仍被节点使用")
@@ -48,6 +51,10 @@ type QualityProbeInput struct {
 	MatchMode       string
 	RequireThinking bool
 	MaxOutputTokens int
+	// Kind selects the probe baseline: "" / "text" runs the reasoning probe
+	// (missing-thinking strikes apply); "html" runs the HTML generation probe
+	// (visual + throughput evidence only, strikes skipped).
+	Kind string
 }
 
 type QualityProbeResult struct {
@@ -71,6 +78,46 @@ type QualityProbeResult struct {
 
 type QualityProber interface {
 	ProbeEgressQuality(context.Context, uint64, QualityProbeInput) (QualityProbeResult, error)
+	ProbeAccountQuality(context.Context, uint64, uint64, QualityProbeInput, string) (AccountQualityProbeResult, error)
+}
+
+// AccountController lets the quality-guard panels operate on probe targets:
+// operator-ordered cooldowns (隔离) and the one-click restore counterpart.
+type AccountController interface {
+	QuarantineAccount(context.Context, uint64, time.Duration) error
+	QuarantineAccounts(context.Context, []uint64, time.Duration) ([]uint64, []uint64, error)
+	RestoreAccount(context.Context, uint64) error
+}
+
+// AccountProbeDefaultsSource lets the caller fill an empty manual probe input
+// from the configured account-probe runtime (client key, model, prompt).
+type AccountProbeDefaultsSource interface {
+	AccountProbeDefaults() QualityProbeInput
+}
+
+type AccountQualityProbeResult struct {
+	RequestID             string
+	AccountID             uint64
+	NodeID                uint64
+	Model                 string
+	Kind                  string
+	StatusCode            int
+	FirstTokenMS          int64
+	DurationMS            int64
+	OutputTokens          int64
+	ReasoningTokens       int64
+	VisibleCharacters     int
+	OutputTokensPerSecond float64
+	ThinkingObserved      bool
+	MissingThinking       bool
+	Action                string
+	// Confirmation carries the second-chance re-test through a random
+	// temporary proxy; it exists when the bound-node probe reported missing
+	// thinking and a healthy tmp-proxy pool was available.
+	Confirmation *AccountQualityProbeResult
+	// Overturned reports that the confirmation round observed thinking on a
+	// fresh exit IP, so the bound-node missing-thinking verdict was rejected.
+	Overturned bool
 }
 
 const (
@@ -85,6 +132,7 @@ type Input struct {
 	Scope             domain.Scope
 	Enabled           bool
 	ProxyPool         *bool
+	Usage             domain.Usage
 	AccountCapacity   *int
 	ProxyURL          *string
 	ProxyProfileID    *uint64
@@ -104,6 +152,7 @@ type ListFilter struct {
 	Enabled     string
 	ProbeStatus string
 	Assignment  string
+	Usage       domain.Usage
 	Sort        repository.SortQuery
 }
 
@@ -124,6 +173,7 @@ type Service struct {
 	prober                      NodeProber
 	operationsCache             OperationsConfigInvalidator
 	qualityProber               QualityProber
+	accountController           AccountController
 	assignmentMu                sync.Mutex
 	lastAssignmentRun           time.Time
 	assignmentRunning           bool
@@ -135,6 +185,49 @@ func (s *Service) SetQualityProber(value QualityProber) {
 	s.mu.Lock()
 	s.qualityProber = value
 	s.mu.Unlock()
+}
+
+// SetAccountController wires the gateway-side account operations used by the
+// quality-guard panels.
+func (s *Service) SetAccountController(value AccountController) {
+	s.mu.Lock()
+	s.accountController = value
+	s.mu.Unlock()
+}
+
+func (s *Service) accountControllerValue() AccountController {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.accountController
+}
+
+// QuarantineAccount applies an operator-ordered cooldown to one account.
+func (s *Service) QuarantineAccount(ctx context.Context, accountID uint64, cooldown time.Duration) error {
+	controller := s.accountControllerValue()
+	if controller == nil {
+		return ErrAccountControlUnavailable
+	}
+	return controller.QuarantineAccount(ctx, accountID, cooldown)
+}
+
+// QuarantineAccounts applies the same operator-ordered cooldown to many
+// accounts and reports the IDs that could not be found.
+func (s *Service) QuarantineAccounts(ctx context.Context, accountIDs []uint64, cooldown time.Duration) ([]uint64, []uint64, error) {
+	controller := s.accountControllerValue()
+	if controller == nil {
+		return nil, nil, ErrAccountControlUnavailable
+	}
+	return controller.QuarantineAccounts(ctx, accountIDs, cooldown)
+}
+
+// RestoreAccount re-enables one account and clears its cooldown, strike
+// marker, and failure backoff.
+func (s *Service) RestoreAccount(ctx context.Context, accountID uint64) error {
+	controller := s.accountControllerValue()
+	if controller == nil {
+		return ErrAccountControlUnavailable
+	}
+	return controller.RestoreAccount(ctx, accountID)
 }
 
 func (s *Service) ProbeQuality(ctx context.Context, nodeID uint64, input QualityProbeInput) (QualityProbeResult, error) {
@@ -192,14 +285,188 @@ func (s *Service) ProbeQuality(ctx context.Context, nodeID uint64, input Quality
 	return result, nil
 }
 
+func normalizeQualityProbeInput(input QualityProbeInput) (QualityProbeInput, error) {
+	input.Model = strings.TrimSpace(input.Model)
+	input.Prompt = strings.TrimSpace(input.Prompt)
+	input.Expected = strings.TrimSpace(input.Expected)
+	input.MatchMode = NormalizeMatchMode(input.MatchMode)
+	if input.Model == "" {
+		return QualityProbeInput{}, fmt.Errorf("%w: model 必填", ErrInvalidInput)
+	}
+	if input.Prompt == "" {
+		input.Prompt = DefaultQualityProbePrompt
+	}
+	if len(input.Prompt) > MaxQualityProbePromptBytes || len(input.Expected) > MaxQualityProbeExpectedBytes {
+		return QualityProbeInput{}, fmt.Errorf("%w: 探测文本过长", ErrInvalidInput)
+	}
+	if input.MaxOutputTokens == 0 {
+		input.MaxOutputTokens = DefaultQualityProbeMaxOutputTokens
+	}
+	if input.MaxOutputTokens < 1 || input.MaxOutputTokens > MaxQualityProbeOutputTokens {
+		return QualityProbeInput{}, fmt.Errorf("%w: maxOutputTokens 必须在 1 到 %d 之间", ErrInvalidInput, MaxQualityProbeOutputTokens)
+	}
+	return input, nil
+}
+
+// ProbeAccountQuality runs one pinned-account probe through the account's own
+// bound long-lived egress node. When the bound-node attempt reports missing
+// thinking, the gateway re-tests once through a random temporary proxy before
+// applying the strike machine: a pass on the fresh IP overturns the verdict.
+// Unbound accounts are never probed.
+func (s *Service) ProbeAccountQuality(ctx context.Context, accountID, nodeID uint64, input QualityProbeInput) (AccountQualityProbeResult, error) {
+	if accountID == 0 {
+		return AccountQualityProbeResult{}, fmt.Errorf("%w: accountId 必填", ErrInvalidInput)
+	}
+	if input.ClientKeyID == 0 {
+		if defaults, ok := s.qualityProberDefaults(); ok {
+			// A missing defaults.ClientKeyID is not fatal here: the gateway
+			// prober falls back to the built-in quality-guard identity.
+			if defaults.ClientKeyID > 0 {
+				input.ClientKeyID = defaults.ClientKeyID
+			}
+			if strings.TrimSpace(input.Model) == "" {
+				input.Model = defaults.Model
+			}
+			if strings.TrimSpace(input.Prompt) == "" {
+				input.Prompt = defaults.Prompt
+			}
+			if input.MaxOutputTokens == 0 {
+				input.MaxOutputTokens = defaults.MaxOutputTokens
+			}
+		}
+	}
+	input, err := normalizeQualityProbeInput(input)
+	if err != nil {
+		return AccountQualityProbeResult{}, err
+	}
+	if s.accounts == nil {
+		return AccountQualityProbeResult{}, ErrOperationsUnavailable
+	}
+	binding, err := s.accounts.GetAccountEgressNodeID(ctx, accountID)
+	if err != nil {
+		return AccountQualityProbeResult{}, err
+	}
+	if binding == 0 {
+		return AccountQualityProbeResult{}, fmt.Errorf("%w: 账号未绑定长效节点，不探测", ErrInvalidInput)
+	}
+	if nodeID != 0 && nodeID != binding {
+		return AccountQualityProbeResult{}, fmt.Errorf("%w: 指定节点与账号绑定的长效节点不一致", ErrInvalidInput)
+	}
+	if err := s.ensureProbeableBoundNode(ctx, binding); err != nil {
+		return AccountQualityProbeResult{}, err
+	}
+	s.mu.RLock()
+	prober := s.qualityProber
+	s.mu.RUnlock()
+	if prober == nil {
+		return AccountQualityProbeResult{}, ErrQualityProbeUnavailable
+	}
+	input.RequireThinking = input.RequireThinking && modeldomain.SupportsReasoningForProvider(accountdomain.ProviderBuild, input.Model)
+	return prober.ProbeAccountQuality(ctx, accountID, binding, input, auditdomain.ProbeSampleSourceManual)
+}
+
+// ensureProbeableBoundNode verifies the account's bound node can carry the
+// probe right now: production usage, enabled, with a proxy configured.
+func (s *Service) ensureProbeableBoundNode(ctx context.Context, nodeID uint64) error {
+	node, err := s.repository.GetEgressNode(ctx, nodeID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if node.Usage != domain.UsageProduction {
+		return fmt.Errorf("%w: 账号绑定节点不是长效节点，无法探测", ErrInvalidInput)
+	}
+	if !node.Enabled || strings.TrimSpace(node.EncryptedProxyURL) == "" {
+		return fmt.Errorf("%w: 绑定节点当前不可用（禁用或缺少代理）", ErrInvalidInput)
+	}
+	if node.Scope != domain.ScopeBuild {
+		return fmt.Errorf("%w: 绑定节点作用域与 Build 路由不匹配", ErrInvalidInput)
+	}
+	return nil
+}
+
+func (s *Service) qualityProberDefaults() (QualityProbeInput, bool) {
+	s.mu.RLock()
+	prober := s.qualityProber
+	s.mu.RUnlock()
+	if source, ok := prober.(AccountProbeDefaultsSource); ok {
+		return source.AccountProbeDefaults(), true
+	}
+	return QualityProbeInput{}, false
+}
+
+// ProbePoolNodes lists healthy probe-usage (temporary) nodes used for the
+// account probe's second-chance confirmation round: when the bound-node probe
+// reports missing thinking, one random node from this pool re-tests with a
+// fresh exit IP to rule out a node/IP-side false positive.
+func (s *Service) ProbePoolNodes(ctx context.Context) ([]domain.Node, error) {
+	nodes, err := s.repository.ListEgressNodes(ctx, "", repository.SortQuery{})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]domain.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if node.Usage == domain.UsageProbe && node.Enabled && strings.TrimSpace(node.EncryptedProxyURL) != "" && node.ProbeStatus == domain.ProbeStatusHealthy {
+			result = append(result, node)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	return result, nil
+}
+
 // AccountBindingRepository is intentionally narrow so existing account
 // repository consumers do not gain egress concerns.
 type AccountBindingRepository interface {
 	CountProviderAccountsByIDs(context.Context, accountdomain.Provider, []uint64) (int64, error)
 	UpdateEgressBindings(context.Context, accountdomain.Provider, []uint64, *uint64, accountdomain.EgressAssignmentMode, time.Time) (int64, error)
 	ListEgressAssignments(context.Context, accountdomain.Provider) ([]accountdomain.Credential, error)
+	ListEgressAccountsByNode(context.Context, uint64) ([]accountdomain.Credential, error)
 	ListEgressBindingProviders(context.Context, uint64) ([]accountdomain.Provider, error)
 	ListEgressSourceBindingProviders(context.Context, uint64) ([]accountdomain.Provider, error)
+	// GetAccountEgressNodeID resolves the account's currently bound egress
+	// node (0 when unbound) for quality-probe routing.
+	GetAccountEgressNodeID(context.Context, uint64) (uint64, error)
+}
+
+// NodeAccountSummary is the per-node binding view: which accounts reserve a
+// slot on this proxy, without exposing credentials.
+type NodeAccountSummary struct {
+	ID             uint64
+	Provider       accountdomain.Provider
+	Name           string
+	Email          string
+	Enabled        bool
+	AuthStatus     string
+	AssignmentMode string
+}
+
+// ListNodeAccounts lists the accounts bound to one egress node.
+func (s *Service) ListNodeAccounts(ctx context.Context, nodeID uint64) ([]NodeAccountSummary, error) {
+	if s.accounts == nil {
+		return nil, ErrOperationsUnavailable
+	}
+	if nodeID == 0 {
+		return nil, ErrNotFound
+	}
+	credentials, err := s.accounts.ListEgressAccountsByNode(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]NodeAccountSummary, 0, len(credentials))
+	for _, credential := range credentials {
+		result = append(result, NodeAccountSummary{
+			ID:             credential.ID,
+			Provider:       credential.Provider,
+			Name:           credential.Name,
+			Email:          credential.Email,
+			Enabled:        credential.Enabled,
+			AuthStatus:     string(credential.AuthStatus),
+			AssignmentMode: string(credential.EgressAssignmentMode),
+		})
+	}
+	return result, nil
 }
 
 type AssignmentResult struct {
@@ -270,7 +537,8 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	page, pageSize = repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
 	if !validListScope(filter.Scope) || !validListValue(filter.Enabled, "enabled", "disabled") ||
 		!validListValue(filter.ProbeStatus, string(domain.ProbeStatusHealthy), string(domain.ProbeStatusUnhealthy), string(domain.ProbeStatusUnknown)) ||
-		!validListValue(filter.Assignment, "bound", "unbound") {
+		!validListValue(filter.Assignment, "bound", "unbound") ||
+		!validListValue(string(filter.Usage), string(domain.UsageProduction), string(domain.UsageProbe)) {
 		return nil, 0, ErrInvalidFilter
 	}
 	if !repository.IsValidSort(filter.Sort, "name", "scope", "proxy", "clearance", "health") {
@@ -285,6 +553,7 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: strings.TrimSpace(search), Sort: filter.Sort},
 		Filter: repository.EgressNodeListFilter{
 			Scope: filter.Scope, Enabled: enabled, ProbeStatus: domain.ProbeStatus(filter.ProbeStatus), Assignment: filter.Assignment,
+			Usage: filter.Usage,
 		},
 	})
 	if err != nil {
@@ -852,6 +1121,9 @@ func (s *Service) AssignAccounts(ctx context.Context, nodeID uint64, provider ac
 	if err != nil {
 		return AssignmentResult{}, err
 	}
+	if node.Usage == domain.UsageProbe {
+		return AssignmentResult{}, fmt.Errorf("%w: 临时代理仅供账号探测使用，不能绑定账号", ErrInvalidInput)
+	}
 	if !node.Enabled || strings.TrimSpace(node.EncryptedProxyURL) == "" {
 		return AssignmentResult{}, fmt.Errorf("%w: 只能绑定启用且已配置代理地址的节点", ErrInvalidInput)
 	}
@@ -996,6 +1268,9 @@ func (s *Service) applyInput(value domain.Node, input Input, create bool) (domai
 		return domain.Node{}, fmt.Errorf("%w: scope 必须是 grok_build、grok_web、grok_console、grok_web_asset 或 grok_console_asset", ErrInvalidInput)
 	}
 	value.Name, value.Scope, value.Enabled, value.ProxyPool = name, input.Scope, input.Enabled, proxyPool
+	if create {
+		value.Usage = input.Usage.Normalize()
+	}
 	if input.AccountCapacity != nil {
 		if *input.AccountCapacity < 0 || *input.AccountCapacity > 100000 {
 			return domain.Node{}, fmt.Errorf("%w: 每个代理的账号容量必须在 0 到 100000 之间", ErrInvalidInput)
@@ -1097,6 +1372,7 @@ func (s *Service) publicNode(value domain.Node) domain.PublicNode {
 		ProxyConfigured: value.EncryptedProxyURL != "", ProxyDisplay: proxyDisplay, ProxyFingerprint: proxyFingerprint,
 		UserAgent: userAgent, CookieConfigured: value.EncryptedCloudflareCookie != "",
 		ProxyPool:         proxyPool,
+		Usage:             value.Usage.Normalize(),
 		SourceID:          value.SourceID,
 		AccountCapacity:   value.AccountCapacity,
 		ProxyProfileID:    value.ProxyProfileID,

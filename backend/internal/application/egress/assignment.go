@@ -20,10 +20,21 @@ const (
 	maxAutomaticReassignments       = 200
 )
 
+type RebalanceNodeStats struct {
+	Total     int
+	Healthy   int
+	Unprobed  int
+	Unhealthy int
+	Cooldown  int
+	Disabled  int
+}
+
 type RebalanceResult struct {
 	Assigned   int
 	Rebalanced int
+	Released   int
 	Unplaced   int
+	Nodes      RebalanceNodeStats
 }
 
 // RebalanceAccounts allocates only accounts that are either unbound or
@@ -39,10 +50,8 @@ func (s *Service) RebalanceAccounts(ctx context.Context, autoAssign, autoBalance
 	s.assignmentMu.Lock()
 	defer s.assignmentMu.Unlock()
 	now := time.Now().UTC()
-	if probeInterval <= 0 {
-		probeInterval = defaultProbeIntervalSeconds * time.Second
-	}
 	result := RebalanceResult{}
+	nodesListed := false
 	for _, provider := range accountdomain.Providers() {
 		// Node capacity is global across Provider pools. Refresh the counts after
 		// each provider so Web and Console assignments cannot overfill a shared
@@ -51,7 +60,11 @@ func (s *Service) RebalanceAccounts(ctx context.Context, autoAssign, autoBalance
 		if err != nil {
 			return result, err
 		}
-		providerResult, providerErr := s.rebalanceProvider(ctx, provider, nodes, autoAssign, autoBalance, probeInterval, now)
+		if !nodesListed {
+			result.Nodes = classifyRebalanceNodes(nodes, now)
+			nodesListed = true
+		}
+		providerResult, providerErr := s.rebalanceProvider(ctx, provider, nodes, autoAssign, autoBalance, now)
 		result.Assigned += providerResult.Assigned
 		result.Rebalanced += providerResult.Rebalanced
 		result.Unplaced += providerResult.Unplaced
@@ -62,12 +75,12 @@ func (s *Service) RebalanceAccounts(ctx context.Context, autoAssign, autoBalance
 	return result, nil
 }
 
-func (s *Service) rebalanceProvider(ctx context.Context, provider accountdomain.Provider, allNodes []domain.Node, autoAssign, autoBalance bool, probeInterval time.Duration, now time.Time) (RebalanceResult, error) {
+func (s *Service) rebalanceProvider(ctx context.Context, provider accountdomain.Provider, allNodes []domain.Node, autoAssign, autoBalance bool, now time.Time) (RebalanceResult, error) {
 	accounts, err := s.accounts.ListEgressAssignments(ctx, provider)
 	if err != nil {
 		return RebalanceResult{}, err
 	}
-	nodes := s.eligibleNodesForProvider(allNodes, provider, probeInterval, now)
+	nodes := s.eligibleNodesForProvider(allNodes, provider)
 	if len(nodes) == 0 {
 		return RebalanceResult{Unplaced: countAutoAssignable(accounts, autoAssign, autoBalance)}, nil
 	}
@@ -77,23 +90,34 @@ func (s *Service) rebalanceProvider(ctx context.Context, provider accountdomain.
 	migrations := 0
 	loads := make(map[uint64]int, len(nodes))
 	byID := make(map[uint64]domain.Node, len(nodes))
+	released := make([]uint64, 0)
+	releaseByNode := make(map[uint64]int)
+	for _, credential := range accounts {
+		if credential.EgressNodeID != 0 && !credential.Enabled {
+			released = append(released, credential.ID)
+			releaseByNode[credential.EgressNodeID]++
+		}
+	}
 	for _, node := range nodes {
-		loads[node.ID] = node.AssignedAccountCount
+		load := node.AssignedAccountCount - releaseByNode[node.ID]
+		if load < 0 {
+			load = 0
+		}
+		loads[node.ID] = load
 		byID[node.ID] = node
 	}
 	original := make(map[uint64]uint64, len(accounts))
 	assignment := make(map[uint64]uint64, len(accounts))
 	freshMove := make(map[uint64]bool)
 	result := RebalanceResult{}
-
 	for _, credential := range accounts {
 		original[credential.ID] = credential.EgressNodeID
 		assignment[credential.ID] = credential.EgressNodeID
 		if !isAutoAssignable(credential, autoAssign, autoBalance) {
 			continue
 		}
-		_, currentHealthy := byID[credential.EgressNodeID]
-		needsPlacement := credential.EgressNodeID == 0 || !currentHealthy
+		current, currentBound := byID[credential.EgressNodeID]
+		needsPlacement := credential.EgressNodeID == 0 || !currentBound || current.ProbeStatus == domain.ProbeStatusUnhealthy
 		if !needsPlacement {
 			continue
 		}
@@ -184,6 +208,12 @@ func (s *Service) rebalanceProvider(ctx context.Context, provider accountdomain.
 		if _, err := s.accounts.UpdateEgressBindings(ctx, provider, ids, &nodeID, accountdomain.EgressAssignmentAuto, now); err != nil {
 			return result, err
 		}
+	}
+	if len(released) > 0 {
+		if _, err := s.accounts.UpdateEgressBindings(ctx, provider, released, nil, "", time.Time{}); err != nil {
+			return result, err
+		}
+		result.Released = len(released)
 	}
 	return result, nil
 }
@@ -289,21 +319,65 @@ func validAutoAssignShare(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0) && (value == 0 || (value >= 0.05 && value <= 1))
 }
 
-func (s *Service) eligibleNodesForProvider(values []domain.Node, provider accountdomain.Provider, probeInterval time.Duration, now time.Time) []domain.Node {
-	values = append([]domain.Node(nil), values...)
+// eligibleNodesForProvider lists the production nodes an account may bind to
+// during rebalance. Deliberately lenient: probe status, freshness, and
+// cooldowns are ignored so freshly imported or quarantined nodes still accept
+// assignments — the request path re-checks health and the periodic probe
+// repairs statuses. Only disabled or structurally unusable nodes are skipped.
+// Healthy nodes are offered first so load ties prefer them over degraded ones.
+func (s *Service) eligibleNodesForProvider(values []domain.Node, provider accountdomain.Provider) []domain.Node {
 	result := make([]domain.Node, 0, len(values))
-	maxAge := max(probeInterval*2, time.Minute)
 	for _, value := range values {
-		if !value.Enabled || value.EncryptedProxyURL == "" || !scopeSupportsProvider(value.Scope, provider) || value.ProbeStatus != domain.ProbeStatusHealthy || value.LastProbedAt == nil || now.Sub(value.LastProbedAt.UTC()) > maxAge {
-			continue
-		}
-		if value.CooldownUntil != nil && now.Before(value.CooldownUntil.UTC()) && !value.ProxyPool && !s.accountBoundProxy(value) {
+		if value.Usage != domain.UsageProduction || !value.Enabled || value.EncryptedProxyURL == "" || !scopeSupportsProvider(value.Scope, provider) {
 			continue
 		}
 		result = append(result, value)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	rank := func(value domain.Node) int {
+		switch value.ProbeStatus {
+		case domain.ProbeStatusHealthy:
+			return 0
+		case domain.ProbeStatusUnhealthy:
+			return 2
+		default:
+			return 1
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if rank(result[i]) != rank(result[j]) {
+			return rank(result[i]) < rank(result[j])
+		}
+		return result[i].ID < result[j].ID
+	})
 	return result
+}
+
+// classifyRebalanceNodes reports the production node fleet by probe state so
+// the operator UI can explain why assignments landed the way they did.
+func classifyRebalanceNodes(values []domain.Node, now time.Time) RebalanceNodeStats {
+	stats := RebalanceNodeStats{}
+	for _, value := range values {
+		if value.Usage != domain.UsageProduction {
+			continue
+		}
+		stats.Total++
+		if !value.Enabled {
+			stats.Disabled++
+			continue
+		}
+		switch value.ProbeStatus {
+		case domain.ProbeStatusHealthy:
+			stats.Healthy++
+		case domain.ProbeStatusUnhealthy:
+			stats.Unhealthy++
+		default:
+			stats.Unprobed++
+		}
+		if value.CooldownUntil != nil && now.Before(value.CooldownUntil.UTC()) {
+			stats.Cooldown++
+		}
+	}
+	return stats
 }
 
 func isAutoAssignable(credential accountdomain.Credential, autoAssign, autoBalance bool) bool {

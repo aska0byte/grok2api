@@ -46,6 +46,16 @@ func ClassifyOutputSpeed(outputTokens, reasoningTokens, firstTokenMS, durationMS
 // tail is implausibly short. Rows without reasoning evidence retain the tail so
 // real buffered output bursts remain visible to the fail-closed guard.
 func GenerationWindowMS(firstTokenMS, durationMS, reasoningTokens int64) int64 {
+	return GenerationWindowMSObserved(firstTokenMS, durationMS, reasoningTokens > 0)
+}
+
+// GenerationWindowMSObserved is GenerationWindowMS with an explicit
+// reasoning-evidence override. Usage.reasoning_tokens is one evidence source;
+// probe parsers also observe the reasoning-start stub and streamed reasoning
+// delta text on streams whose usage never reports reasoning tokens. The same
+// full-duration fallback applies so a buffered dump is not crushed into the
+// flush window.
+func GenerationWindowMSObserved(firstTokenMS, durationMS int64, reasoningObserved bool) int64 {
 	if durationMS <= 0 {
 		return 0
 	}
@@ -56,14 +66,23 @@ func GenerationWindowMS(firstTokenMS, durationMS, reasoningTokens int64) int64 {
 		return 0
 	}
 	generationMS := durationMS - firstTokenMS
-	if reasoningTokens > 0 && generationMS < firstTokenMS && generationMS < DefaultDegradeMinGenMS {
+	if reasoningObserved && generationMS < firstTokenMS && generationMS < DefaultDegradeMinGenMS {
 		return durationMS
 	}
 	return generationMS
 }
 
 func OutputTokensPerSecond(outputTokens, reasoningTokens, firstTokenMS, durationMS int64) float64 {
-	generationMS := GenerationWindowMS(firstTokenMS, durationMS, reasoningTokens)
+	return OutputTokensPerSecondObserved(outputTokens, reasoningTokens, firstTokenMS, durationMS, reasoningTokens > 0)
+}
+
+// OutputTokensPerSecondObserved is OutputTokensPerSecond with an explicit
+// reasoning-evidence override for stream parsers that know reasoning was
+// claimed (the reasoning-start stub) or streamed (delta text) even when the
+// usage frame reports zero reasoning tokens — 降智 upstreams emit exactly that
+// shape, and their buffered flushes need the same window protection.
+func OutputTokensPerSecondObserved(outputTokens, reasoningTokens, firstTokenMS, durationMS int64, reasoningObserved bool) float64 {
+	generationMS := GenerationWindowMSObserved(firstTokenMS, durationMS, reasoningObserved)
 	if outputTokens <= 0 || generationMS <= 0 {
 		return 0
 	}

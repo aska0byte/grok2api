@@ -464,6 +464,63 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 	return result, nil
 }
 
+// ListRoutingCandidateForProbe loads exactly one account for an operator
+// quality probe, ignoring enabled/auth/binding/capability filters: cooled,
+// disabled, and reauth-required accounts must stay probeable so the operator
+// can collect upstream evidence (200/401/403) before deciding whether to
+// disable them permanently. Returns ok=false when the account no longer
+// exists.
+func (r *AccountRepository) ListRoutingCandidateForProbe(ctx context.Context, provider account.Provider, accountID uint64) (account.RoutingCandidate, bool, error) {
+	var row accountModel
+	err := r.db.db.WithContext(ctx).
+		Where("provider = ? AND id = ?", provider, accountID).
+		Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return account.RoutingCandidate{}, false, nil
+	}
+	if err != nil {
+		return account.RoutingCandidate{}, false, mapError(err)
+	}
+	values := []account.Credential{toAccountDomain(row)}
+	if err := r.attachProbeEgressIdentities(ctx, accountID, values); err != nil {
+		return account.RoutingCandidate{}, false, err
+	}
+	// Capability/billing/recovery state is irrelevant for a pinned probe: the
+	// selector bypasses every soft scheduling gate and the physical call is
+	// pinned to the account's bound egress node.
+	return account.RoutingCandidate{Credential: values[0], ModelCapabilityKnown: true, SupportsModel: true}, true, nil
+}
+
+// attachProbeEgressIdentities mirrors attachRoutingEgressIdentities for one
+// account without enabled/auth filters so a disabled or flagged account keeps
+// its linked web identity during operator probes.
+func (r *AccountRepository) attachProbeEgressIdentities(ctx context.Context, accountID uint64, values []account.Credential) error {
+	if len(values) == 0 {
+		return nil
+	}
+	var rows []struct {
+		WebSourceKey   string
+		EgressIdentity *string
+	}
+	if err := r.db.db.WithContext(ctx).Table("account_provider_links AS link").
+		Select("web.source_key AS web_source_key, profile.egress_identity").
+		Joins("JOIN provider_accounts AS web ON web.id = link.web_account_id").
+		Joins("LEFT JOIN web_account_profiles AS profile ON profile.account_id = web.id").
+		Where("link.build_account_id = ?", accountID).
+		Scan(&rows).Error; err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	stored := ""
+	if rows[0].EgressIdentity != nil {
+		stored = *rows[0].EgressIdentity
+	}
+	values[0].EgressIdentity = linkedWebEgressIdentity(stored, rows[0].WebSourceKey)
+	return nil
+}
+
 func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provider account.Provider, quotaMode string) ([]account.RoutingAccountBase, error) {
 	values, err := r.listRoutingCredentials(ctx, provider)
 	if err != nil {
@@ -513,7 +570,36 @@ func (r *AccountRepository) listRoutingCredentials(ctx context.Context, provider
 	if err := r.attachRoutingEgressIdentities(ctx, provider, values); err != nil {
 		return nil, err
 	}
-	return values, nil
+	return r.filterBuildBoundRoutingCredentials(ctx, provider, values)
+}
+
+// filterBuildBoundRoutingCredentials keeps ordinary Build inference on
+// accounts explicitly bound to a long-lived (production) egress node, so an
+// account without a binding never serves traffic. The restriction only arms
+// once the deployment has at least one usable production node: with none
+// configured (legacy direct-egress setups) no account could ever bind and
+// filtering would strand the whole pool.
+func (r *AccountRepository) filterBuildBoundRoutingCredentials(ctx context.Context, provider account.Provider, values []account.Credential) ([]account.Credential, error) {
+	if provider != account.ProviderBuild || len(values) == 0 {
+		return values, nil
+	}
+	var usable int64
+	if err := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).
+		Where("usage = ? AND enabled = ? AND encrypted_proxy_url <> ''", "production", true).
+		Limit(1).Count(&usable).Error; err != nil {
+		return nil, err
+	}
+	if usable == 0 {
+		return values, nil
+	}
+	filtered := make([]account.Credential, 0, len(values))
+	for _, value := range values {
+		if value.EgressNodeID == 0 {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered, nil
 }
 
 // listActiveProviderAccountRows avoids GORM association preloads for complete
@@ -794,6 +880,64 @@ func (r *AccountRepository) ListEnabled(ctx context.Context, provider account.Pr
 	return out, nil
 }
 
+// ListMissingThinkingStrikes 返回当前持有 missing_thinking 标记（冷却中）且仍启用
+// 的 Build 账号，供账号降智探测调度器复核；按冷却结束时间升序排列。
+func (r *AccountRepository) ListMissingThinkingStrikes(ctx context.Context, _ time.Time, limit int) ([]account.Credential, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var rows []accountModel
+	err := r.db.db.WithContext(ctx).
+		Table("provider_accounts AS account").
+		Select("account.*").
+		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ? AND account.last_error IN ?",
+			account.ProviderBuild, true, account.AuthStatusActive,
+			[]string{account.LastErrorMissingThinking, account.LastErrorMissingThinkingDisabled}).
+		Order("account.cooldown_until ASC, account.id ASC").
+		Limit(limit).
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]account.Credential, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, toAccountDomain(row))
+	}
+	if err := r.attachRoutingEgressIdentities(ctx, account.ProviderBuild, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListEgressBoundAccounts 返回已绑定可用长效（production）出口节点的启用 Build
+// 账号，作为账号降智探测的全量轮转候选；绑定节点禁用或无代理的账号视为未绑定。
+func (r *AccountRepository) ListEgressBoundAccounts(ctx context.Context, limit int) ([]account.Credential, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var rows []accountModel
+	err := r.db.db.WithContext(ctx).
+		Table("provider_accounts AS account").
+		Select("account.*").
+		Joins("JOIN egress_nodes AS node ON node.id = account.egress_node_id").
+		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ?", account.ProviderBuild, true, account.AuthStatusActive).
+		Where("node.enabled = ? AND node.usage = ? AND node.encrypted_proxy_url <> ''", true, "production").
+		Order("account.id ASC").
+		Limit(limit).
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]account.Credential, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, toAccountDomain(row))
+	}
+	if err := r.attachRoutingEgressIdentities(ctx, account.ProviderBuild, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (r *AccountRepository) ListEnabledAccountIDs(ctx context.Context, provider account.Provider, refreshableOnly bool) ([]uint64, error) {
 	query := r.db.db.WithContext(ctx).
 		Table("provider_accounts AS account").
@@ -963,6 +1107,22 @@ func (r *AccountRepository) GetCredentialMaterial(ctx context.Context, accountID
 		Select("credential.*").
 		Joins("JOIN provider_accounts AS account ON account.id = credential.account_id").
 		Where("credential.account_id = ? AND account.provider = ? AND account.enabled = TRUE AND account.auth_status = ?", accountID, provider, account.AuthStatusActive).
+		Take(&row).Error; err != nil {
+		return account.CredentialMaterial{}, mapError(err)
+	}
+	return toCredentialMaterialDomain(row, provider), nil
+}
+
+// GetCredentialMaterialForProbe hydrates the encrypted provider data for the
+// pinned quality-probe path: operator evidence gathering must also work on
+// disabled or reauth-pending accounts, so no scheduling filters apply here.
+func (r *AccountRepository) GetCredentialMaterialForProbe(ctx context.Context, accountID uint64, provider account.Provider) (account.CredentialMaterial, error) {
+	var row accountCredentialModel
+	if err := r.db.db.WithContext(ctx).
+		Table("account_credentials AS credential").
+		Select("credential.*").
+		Joins("JOIN provider_accounts AS account ON account.id = credential.account_id").
+		Where("credential.account_id = ? AND account.provider = ?", accountID, provider).
 		Take(&row).Error; err != nil {
 		return account.CredentialMaterial{}, mapError(err)
 	}
@@ -1631,6 +1791,51 @@ func (r *AccountRepository) ListEgressBindingProviders(ctx context.Context, node
 		return []account.Provider{}, nil
 	}
 	return r.listEgressBindingProviders(r.db.db.WithContext(ctx).Model(&accountModel{}).Where("egress_node_id = ?", nodeID))
+}
+
+// GetAccountEgressNodeID resolves the account's currently bound egress node.
+// Zero means the account has no explicit binding.
+func (r *AccountRepository) GetAccountEgressNodeID(ctx context.Context, accountID uint64) (uint64, error) {
+	if accountID == 0 {
+		return 0, nil
+	}
+	// NOTE: never Pluck into **T here — gorm's default scan branch calls
+	// rows.Scan without Next() on double pointers ("Scan called without
+	// calling Next"). A Take into a struct with a nullable field is safe.
+	var row struct {
+		EgressNodeID *uint64
+	}
+	if err := r.db.db.WithContext(ctx).Model(&accountModel{}).
+		Select("egress_node_id").
+		Where("id = ?", accountID).
+		Take(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, nil
+		}
+		return 0, mapError(err)
+	}
+	if row.EgressNodeID == nil {
+		return 0, nil
+	}
+	return *row.EgressNodeID, nil
+}
+
+// ListEgressAccountsByNode returns every account bound to one egress node,
+// including disabled accounts so the node view reflects reserved slots.
+func (r *AccountRepository) ListEgressAccountsByNode(ctx context.Context, nodeID uint64) ([]account.Credential, error) {
+	if nodeID == 0 {
+		return []account.Credential{}, nil
+	}
+	var rows []accountModel
+	if err := r.db.db.WithContext(ctx).Preload("Credential").Preload("WebProfile").
+		Where("egress_node_id = ?", nodeID).Order("id ASC").Find(&rows).Error; err != nil {
+		return nil, mapError(err)
+	}
+	values := make([]account.Credential, 0, len(rows))
+	for _, row := range rows {
+		values = append(values, toAccountDomain(row))
+	}
+	return values, nil
 }
 
 func (r *AccountRepository) ListEgressSourceBindingProviders(ctx context.Context, sourceID uint64) ([]account.Provider, error) {

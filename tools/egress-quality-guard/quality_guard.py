@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import fcntl
 import json
 import os
 import random
@@ -24,7 +23,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    import fcntl  # type: ignore
+except ImportError:  # Windows
+    fcntl = None  # type: ignore
+
+try:
+    import msvcrt  # type: ignore
+except ImportError:
+    msvcrt = None  # type: ignore
 
 
 RUNTIME_CONFIG_FIELDS = {
@@ -39,9 +48,12 @@ RUNTIME_CONFIG_FIELDS = {
     "min_healthy_nodes",
 }
 
+RUNTIME_CONFIG_OPTIONAL_FIELDS = {"enabled"}
+
 
 BOOTSTRAP_VERSION = 1
-BOOTSTRAP_FILE = Path("/var/lib/grok2api-quality-guard/bootstrap.json")
+_guard_dir = os.environ.get("GROK2API_QUALITY_GUARD_DIR", "").strip()
+BOOTSTRAP_FILE = Path(_guard_dir) / "bootstrap.json" if _guard_dir else Path("/var/lib/grok2api-quality-guard/bootstrap.json")
 DEFAULT_GROK2API_BASE_URL = "http://grok2api:8000"
 INTERNAL_API_PREFIX = "/api/internal/v1/quality-guard"
 QUALITY_MARKER_PROFILE_ID = "quality-marker"
@@ -58,7 +70,7 @@ class Config:
     base_url: str
     internal_token: str
     model: str
-    node_ids: tuple[str, ...]
+    node_ids: Tuple[str, ...]
     mode: str
     active_interval_seconds: int
     passive_poll_seconds: int
@@ -79,16 +91,20 @@ class Config:
     rotation_url: str
     rotation_token: str
     rotation_timeout_seconds: int
-    rotatable_node_ids: tuple[str, ...]
+    rotatable_node_ids: Tuple[str, ...]
     prompt: str
     expected: str
     state_file: Path
     lock_file: Path
     runtime_config_file: Path
     profiles_file: Path = dataclasses.field(default_factory=lambda: Path("/var/lib/grok2api-quality-guard/profiles.json"))
+    enabled: bool = True
 
     @classmethod
-    def from_bootstrap(cls, path: Path = BOOTSTRAP_FILE) -> "Config":
+    def from_bootstrap(cls, path: Optional[Path] = None) -> "Config":
+        if path is None:
+            env_dir = os.environ.get("GROK2API_QUALITY_GUARD_DIR", "").strip()
+            path = Path(env_dir) / "bootstrap.json" if env_dir else BOOTSTRAP_FILE
         try:
             with path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
@@ -107,6 +123,8 @@ class Config:
         node_ids = tuple(dict.fromkeys(str(value).strip() for value in values.get("node_ids", []) if str(value).strip()))
         rotatable_node_ids = tuple(dict.fromkeys(str(value).strip() for value in values.get("rotatable_node_ids", []) if str(value).strip()))
         base_url = os.environ.get("GROK2API_BASE_URL", "").strip() or DEFAULT_GROK2API_BASE_URL
+        guard_dir_env = os.environ.get("GROK2API_QUALITY_GUARD_DIR", "").strip()
+        guard_base = Path(guard_dir_env) if guard_dir_env else Path("/var/lib/grok2api-quality-guard")
         config = cls(
             base_url=base_url.rstrip("/"),
             internal_token=token,
@@ -135,10 +153,10 @@ class Config:
             rotatable_node_ids=rotatable_node_ids,
             prompt=str(values.get("prompt") or "").strip(),
             expected=str(values.get("expected") or "").strip(),
-            state_file=Path("/var/lib/grok2api-quality-guard/state.json"),
-            lock_file=Path("/var/lib/grok2api-quality-guard/guard.lock"),
-            runtime_config_file=Path("/var/lib/grok2api-quality-guard/runtime-config.json"),
-            profiles_file=Path("/var/lib/grok2api-quality-guard/profiles.json"),
+            state_file=guard_base / "state.json",
+            lock_file=guard_base / "guard.lock",
+            runtime_config_file=guard_base / "runtime-config.json",
+            profiles_file=guard_base / "profiles.json",
         )
         config.validate()
         return config
@@ -206,13 +224,15 @@ def load_runtime_config(base: Config, path: Path) -> Config:
     if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("settings"), dict):
         raise ValueError("unsupported runtime quality guard config")
     settings = value["settings"]
-    unknown = set(settings) - RUNTIME_CONFIG_FIELDS
+    unknown = set(settings) - RUNTIME_CONFIG_FIELDS - RUNTIME_CONFIG_OPTIONAL_FIELDS
     if unknown:
         raise ValueError("runtime quality guard config contains unknown fields")
-    if set(settings) != RUNTIME_CONFIG_FIELDS:
+    if RUNTIME_CONFIG_FIELDS - set(settings):
         raise ValueError("runtime quality guard config is incomplete")
     if not isinstance(settings["mode"], str):
         raise ValueError("runtime quality guard mode must be a string")
+    if not isinstance(settings.get("enabled", True), bool):
+        raise ValueError("runtime quality guard enabled flag must be a boolean")
     integer_fields = RUNTIME_CONFIG_FIELDS - {"mode", "soft_tps", "hard_tps"}
     if any(isinstance(settings[name], bool) or not isinstance(settings[name], int) for name in integer_fields):
         raise ValueError("runtime quality guard integer field is invalid")
@@ -227,10 +247,10 @@ class RuntimeConfigReloader:
     def __init__(self, base: Config):
         self.base = base
         self.current = base
-        self.signature: tuple[int, int] | None = None
+        self.signature: Optional[Tuple[int, int]] = None
         self.missing = False
 
-    def reload(self, force: bool = False) -> tuple[Config, bool, Exception | None]:
+    def reload(self, force: bool = False) -> Tuple[Config, bool, Optional[Exception]]:
         try:
             stat_result = self.base.runtime_config_file.stat()
             signature = (stat_result.st_mtime_ns, stat_result.st_size)
@@ -265,7 +285,7 @@ class ApiClient:
         self.config = config
         self.ssl_context = ssl.create_default_context()
 
-    def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+    def _request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Any:
         data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
         headers = {"Accept": "application/json"}
         if data is not None:
@@ -286,10 +306,10 @@ class ApiClient:
             raise RuntimeError(f"request failed: {type(exc).__name__}") from exc
         return payload.get("data", payload)
 
-    def list_nodes(self) -> list[dict[str, Any]]:
+    def list_nodes(self) -> List[Dict[str, Any]]:
         page_size = 2000
-        items: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
+        items: List[Dict[str, Any]] = []
+        seen_ids: Set[str] = set()
         page = 1
         while True:
             query = urllib.parse.urlencode({"page": page, "pageSize": page_size, "scope": "grok_build"})
@@ -310,9 +330,9 @@ class ApiClient:
                 raise RuntimeError(f"egress node pagination stopped at {len(items)} of {total}")
             page += 1
 
-    def fixed_fallback_node_ids(self) -> set[str]:
+    def fixed_fallback_node_ids(self) -> Set[str]:
         payload = self._request("GET", f"{INTERNAL_API_PREFIX}/egress-operations")
-        result: set[str] = set()
+        result: Set[str] = set()
         for fallback in (payload.get("fallbacks") or {}).values():
             if not isinstance(fallback, dict) or fallback.get("mode") != "fixed":
                 continue
@@ -321,14 +341,14 @@ class ApiClient:
                 result.add(node_id)
         return result
 
-    def quality_test(self, node_id: str, profile_id: str = "") -> dict[str, Any]:
+    def quality_test(self, node_id: str, profile_id: str = "") -> Dict[str, Any]:
         body = {"profileId": profile_id} if profile_id else {}
         return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/quality-test", body or None)
 
-    def connectivity_test(self, node_id: str) -> dict[str, Any]:
+    def connectivity_test(self, node_id: str) -> Dict[str, Any]:
         return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/test")
 
-    def list_audits(self, cursor: str = "") -> dict[str, Any]:
+    def list_audits(self, cursor: str = "") -> Dict[str, Any]:
         query = {
             "pagination": "cursor",
             "pageSize": self.config.passive_page_size,
@@ -342,7 +362,7 @@ class ApiClient:
         result = self._request("PATCH", f"{INTERNAL_API_PREFIX}/egress-nodes/batch", {"ids": [node_id], "enabled": enabled})
         return int(result.get("updated") or 0)
 
-    def rotate_node(self, node_id: str, old_exit_ip: str = "") -> dict[str, Any]:
+    def rotate_node(self, node_id: str, old_exit_ip: str = "") -> Dict[str, Any]:
         if not self.config.rotation_url:
             raise RuntimeError("rotation endpoint is not configured")
         data = json.dumps({"nodeId": node_id, "oldExitIp": old_exit_ip}, separators=(",", ":")).encode()
@@ -370,7 +390,7 @@ class ApiClient:
         return payload
 
 
-def classify_result(result: dict[str, Any], config: Config, profile: dict[str, Any] | None = None) -> tuple[str, str]:
+def classify_result(result: Dict[str, Any], config: Config, profile: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
     expected = ""
     if profile:
         expected = str(profile.get("expected_text") or profile.get("expected") or "").strip()
@@ -414,7 +434,7 @@ def classify_result(result: dict[str, Any], config: Config, profile: dict[str, A
     return "healthy", "within_threshold"
 
 
-def builtin_probe_profiles() -> dict[str, dict[str, Any]]:
+def builtin_probe_profiles() -> Dict[str, Dict[str, Any]]:
     return {
         QUALITY_MARKER_PROFILE_ID: {
             "id": QUALITY_MARKER_PROFILE_ID,
@@ -433,7 +453,7 @@ def builtin_probe_profiles() -> dict[str, dict[str, Any]]:
     }
 
 
-def load_probe_profiles(path: Path) -> dict[str, Any]:
+def load_probe_profiles(path: Path) -> Dict[str, Any]:
     data = {"version": 1, "active_profile_id": QUALITY_MARKER_PROFILE_ID, "profiles": {}}
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -463,7 +483,7 @@ def load_probe_profiles(path: Path) -> dict[str, Any]:
     return data
 
 
-def resolve_probe_profile(path: Path, profile_id: str = "") -> tuple[str, dict[str, Any] | None]:
+def resolve_probe_profile(path: Path, profile_id: str = "") -> Tuple[str, Optional[Dict[str, Any]]]:
     data = load_probe_profiles(path)
     profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
     active = str(data.get("active_profile_id") or QUALITY_MARKER_PROFILE_ID)
@@ -474,7 +494,7 @@ def resolve_probe_profile(path: Path, profile_id: str = "") -> tuple[str, dict[s
     return chosen, None
 
 
-def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, float, int]:
+def classify_audit(value: Dict[str, Any], config: Config) -> Tuple[str, str, float, int]:
     if value.get("provider") != "grok_build" or not bool(value.get("streaming")):
         return "ignored", "not_build_stream", 0.0, 0
     status = int(value.get("statusCode") or 0)
@@ -515,7 +535,7 @@ def generation_window_ms(first_token_ms: int, duration_ms: int, reasoning_tokens
     return generation_ms
 
 
-def default_node_state() -> dict[str, Any]:
+def default_node_state() -> Dict[str, Any]:
     return {
         "active_soft_strikes": 0,
         "passive_soft_strikes": 0,
@@ -540,7 +560,7 @@ def default_node_state() -> dict[str, Any]:
     }
 
 
-def default_statistics() -> dict[str, Any]:
+def default_statistics() -> Dict[str, Any]:
     return {
         "started_at": time.time(),
         "active": {"total": 0, "healthy": 0, "soft": 0, "hard": 0, "errors": 0, "output_tokens": 0},
@@ -549,7 +569,7 @@ def default_statistics() -> dict[str, Any]:
     }
 
 
-def ensure_statistics(state: dict[str, Any]) -> dict[str, Any]:
+def ensure_statistics(state: Dict[str, Any]) -> Dict[str, Any]:
     defaults = default_statistics()
     statistics = state.setdefault("statistics", {})
     if not isinstance(statistics, dict):
@@ -569,7 +589,7 @@ def ensure_statistics(state: dict[str, Any]) -> dict[str, Any]:
     return statistics
 
 
-def load_state(path: Path) -> dict[str, Any]:
+def load_state(path: Path) -> Dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as handle:
             value = json.load(handle)
@@ -592,7 +612,7 @@ def load_state(path: Path) -> dict[str, Any]:
     return value
 
 
-def save_state(path: Path, state: dict[str, Any]) -> None:
+def save_state(path: Path, state: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary = tempfile.mkstemp(prefix=".state-", dir=path.parent)
     try:
@@ -611,7 +631,7 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         raise
 
 
-def append_state_event(state: dict[str, Any], event: str, **fields: Any) -> None:
+def append_state_event(state: Dict[str, Any], event: str, **fields: Any) -> None:
     events = state.setdefault("recent_events", [])
     events.append({"ts": time.time(), "event": event, **fields})
     del events[:-100]
@@ -666,7 +686,7 @@ class Guard:
         self._update_guard_metadata()
         save_state(self.config.state_file, self.state)
 
-    def _state_for(self, node_id: str) -> dict[str, Any]:
+    def _state_for(self, node_id: str) -> Dict[str, Any]:
         nodes = self.state.setdefault("nodes", {})
         current = nodes.setdefault(node_id, default_node_state())
         legacy_strikes = int(current.pop("soft_strikes", 0))
@@ -678,7 +698,7 @@ class Guard:
             current.setdefault(key, value)
         return current
 
-    def _defer_no_account(self, state: dict[str, Any], node: dict[str, Any], now: float, event: str, **fields: Any) -> None:
+    def _defer_no_account(self, state: Dict[str, Any], node: Dict[str, Any], now: float, event: str, **fields: Any) -> None:
         state["last_probe_at"] = now
         state["last_reason"] = "probe_no_account"
         state["quarantined_until"] = max(
@@ -690,13 +710,17 @@ class Guard:
             state["last_no_account_log_at"] = now
             log_event(event, node_id=str(node["id"]), node_name=node.get("name"), reason="probe_no_account", **fields)
 
-    def _eligible_nodes(self, nodes: list[dict[str, Any]], protected_node_ids: set[str]) -> list[dict[str, Any]]:
+    def _eligible_nodes(self, nodes: List[Dict[str, Any]], protected_node_ids: Set[str]) -> List[Dict[str, Any]]:
         configured = set(self.config.node_ids)
         state_nodes = self.state.get("nodes") or {}
         result = []
         for node in nodes:
             node_id = str(node.get("id") or "")
             if not node_id or not node.get("proxyConfigured"):
+                continue
+            # Tmp-proxy (probe-usage) nodes are reserved for the account
+            # quality probe and must never be managed or quarantined here.
+            if node.get("usage") == "probe":
                 continue
             tracked_quarantine = bool((state_nodes.get(node_id) or {}).get("disabled_by_guard"))
             if node_id in protected_node_ids and not tracked_quarantine:
@@ -710,7 +734,7 @@ class Guard:
                 result.append(node)
         return result
 
-    def _can_quarantine(self, nodes: list[dict[str, Any]], node_id: str) -> bool:
+    def _can_quarantine(self, nodes: List[Dict[str, Any]], node_id: str) -> bool:
         enabled = sum(1 for node in nodes if bool(node.get("enabled")))
         target_enabled = any(str(node.get("id")) == node_id and bool(node.get("enabled")) for node in nodes)
         if self.config.fail_closed:
@@ -732,7 +756,7 @@ class Guard:
     def _probe_account_unavailable(exc: Exception) -> bool:
         return isinstance(exc, ApiError) and exc.code == "egressQualityProbeNoAccount"
 
-    def _quarantine(self, nodes: list[dict[str, Any]], node: dict[str, Any], reason: str, now: float, recover_now: bool = True) -> None:
+    def _quarantine(self, nodes: List[Dict[str, Any]], node: Dict[str, Any], reason: str, now: float, recover_now: bool = True) -> None:
         node_id = str(node["id"])
         state = self._state_for(node_id)
         if not self._can_quarantine(nodes, node_id):
@@ -808,7 +832,7 @@ class Guard:
                 self._save()
                 log_event("node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=str(rotation.get("newExitIp") or ""), trigger="passive_hold")
 
-    def _record_probe(self, node: dict[str, Any], result: dict[str, Any], classification: str, reason: str, now: float) -> None:
+    def _record_probe(self, node: Dict[str, Any], result: Dict[str, Any], classification: str, reason: str, now: float) -> None:
         node_id = str(node["id"])
         state = self._state_for(node_id)
         output_tokens = int(result.get("outputTokens") or result.get("visibleTokens") or 0)
@@ -852,7 +876,7 @@ class Guard:
             expected_matched=bool(result.get("expectedMatched")),
         )
 
-    def _probe_active(self, nodes: list[dict[str, Any]], node: dict[str, Any], now: float, trigger: str = "scheduled") -> None:
+    def _probe_active(self, nodes: List[Dict[str, Any]], node: Dict[str, Any], now: float, trigger: str = "scheduled") -> None:
         node_id = str(node["id"])
         state = self._state_for(node_id)
         if state.get("last_reason") == "probe_no_account" and now < float(state.get("quarantined_until", 0.0)):
@@ -881,7 +905,7 @@ class Guard:
 
     def _recover_quarantined(
         self,
-        node: dict[str, Any],
+        node: Dict[str, Any],
         now: float,
         rotate: bool,
         rotate_on_failure: bool = False,
@@ -966,7 +990,7 @@ class Guard:
         )
 
     @staticmethod
-    def _is_passive_quarantine(state: dict[str, Any]) -> bool:
+    def _is_passive_quarantine(state: Dict[str, Any]) -> bool:
         source = str(state.get("quarantine_source") or "")
         if source == "passive":
             return True
@@ -974,7 +998,7 @@ class Guard:
             return False
         return str(state.get("last_source") or "") == "passive"
 
-    def _probe_quarantined(self, node: dict[str, Any], now: float) -> None:
+    def _probe_quarantined(self, node: Dict[str, Any], now: float) -> None:
         node_id = str(node["id"])
         state = self._state_for(node_id)
         if now < float(state.get("quarantined_until", 0.0)):
@@ -991,7 +1015,7 @@ class Guard:
             rotate_on_failure=passive or reason == "buffered_burst",
         )
 
-    def _prepare_nodes(self, now: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
+    def _prepare_nodes(self, now: float) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Set[str]]:
         all_nodes = self.api.list_nodes()
         protected_node_ids = self.api.fixed_fallback_node_ids()
         previous_protected = set(str(value) for value in self.state.get("protected_node_ids", []))
@@ -1030,7 +1054,7 @@ class Guard:
             tracked = bool((state_nodes.get(stale_id) or {}).get("disabled_by_guard"))
             if stale_id not in present_ids or (stale_id not in managed_ids and not tracked):
                 del state_nodes[stale_id]
-        skip_ids: set[str] = set()
+        skip_ids: Set[str] = set()
         if not nodes:
             log_event("no_eligible_nodes")
             return all_nodes, [], skip_ids
@@ -1082,10 +1106,10 @@ class Guard:
         self.state["last_active_cycle_at"] = time.time()
         self._save()
 
-    def _fetch_new_audits(self) -> list[dict[str, Any]]:
+    def _fetch_new_audits(self) -> List[Dict[str, Any]]:
         known = set(str(value) for value in self.state.get("seen_audit_ids", []))
-        fetched_ids: list[str] = []
-        collected: list[dict[str, Any]] = []
+        fetched_ids: List[str] = []
+        collected: List[Dict[str, Any]] = []
         cursor = ""
         reached_known = False
         for _page in range(self.config.passive_max_pages):
@@ -1127,7 +1151,7 @@ class Guard:
         collected.reverse()
         return collected
 
-    def _record_passive_audit(self, all_nodes: list[dict[str, Any]], node: dict[str, Any], audit_value: dict[str, Any], now: float) -> None:
+    def _record_passive_audit(self, all_nodes: List[Dict[str, Any]], node: Dict[str, Any], audit_value: Dict[str, Any], now: float) -> None:
         node_id = str(node["id"])
         state = self._state_for(node_id)
         classification, reason, speed, output_tokens = classify_audit(audit_value, self.config)
@@ -1208,16 +1232,29 @@ class Guard:
 def acquire_lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     handle = path.open("a+", encoding="utf-8")
-    os.chmod(path, 0o600)
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
-        raise RuntimeError("another quality guard instance is already running")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore
+        except BlockingIOError:
+            handle.close()
+            raise RuntimeError("another quality guard instance is already running")
+    elif msvcrt is not None:
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore
+        except OSError:
+            handle.close()
+            raise RuntimeError("another quality guard instance is already running")
+    else:
+        # 无锁平台：仅作占位，依赖单例启动
+        pass
     return handle
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Active and passive quality guard for grok2api egress nodes")
     parser.add_argument("--once", action="store_true", help="run one cycle for each detector enabled by the selected mode")
     parser.add_argument("--check-config", action="store_true", help="validate config.yaml bootstrap and exit")
@@ -1280,8 +1317,10 @@ def main(argv: list[str] | None = None) -> int:
             next_active = now + max(0.0, last_active_at + config.active_interval_seconds - time.time())
             next_passive = now
             log_event("runtime_config_reloaded", previous_mode=previous_mode, mode=config.mode)
-        active_enabled = config.mode in {"active", "hybrid"}
-        passive_enabled = config.mode in {"passive", "hybrid"}
+            if not config.enabled:
+                log_event("guard_disabled_by_runtime_config")
+        active_enabled = config.mode in {"active", "hybrid"} and config.enabled
+        passive_enabled = config.mode in {"passive", "hybrid"} and config.enabled
         if passive_enabled and now >= next_passive:
             try:
                 guard.run_passive_cycle()

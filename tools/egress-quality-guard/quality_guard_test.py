@@ -293,6 +293,30 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual((loaded.mode, loaded.soft_tps, loaded.quarantine_seconds), ("passive", 400, 600))
             self.assertEqual((loaded.model, loaded.node_ids), (base.model, base.node_ids))
 
+    def test_runtime_config_enabled_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime-config.json"
+            path.write_text('{"version":1,"settings":{"mode":"passive","active_interval_seconds":3600,"passive_poll_seconds":10,"soft_tps":400,"hard_tps":900,"consecutive_soft":3,"consecutive_errors":4,"quarantine_seconds":600,"min_healthy_nodes":2,"enabled":false}}', encoding="utf-8")
+            base = config(runtime_config_file=path, node_ids=("1", "2", "3"))
+            loaded = quality_guard.load_runtime_config(base, path)
+            self.assertFalse(loaded.enabled)
+            self.assertEqual(loaded.mode, "passive")
+
+    def test_runtime_config_enabled_defaults_to_true(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime-config.json"
+            path.write_text('{"version":1,"settings":{"mode":"passive","active_interval_seconds":3600,"passive_poll_seconds":10,"soft_tps":400,"hard_tps":900,"consecutive_soft":3,"consecutive_errors":4,"quarantine_seconds":600,"min_healthy_nodes":2}}', encoding="utf-8")
+            base = config(runtime_config_file=path, node_ids=("1", "2", "3"))
+            self.assertTrue(quality_guard.load_runtime_config(base, path).enabled)
+
+    def test_runtime_config_rejects_non_boolean_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime-config.json"
+            path.write_text('{"version":1,"settings":{"mode":"passive","active_interval_seconds":3600,"passive_poll_seconds":10,"soft_tps":400,"hard_tps":900,"consecutive_soft":3,"consecutive_errors":4,"quarantine_seconds":600,"min_healthy_nodes":2,"enabled":"no"}}', encoding="utf-8")
+            base = config(runtime_config_file=path, node_ids=("1", "2", "3"))
+            with self.assertRaisesRegex(ValueError, "enabled"):
+                quality_guard.load_runtime_config(base, path)
+
     def test_runtime_config_reloader_keeps_last_valid_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime-config.json"

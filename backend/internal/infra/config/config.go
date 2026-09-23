@@ -284,6 +284,36 @@ type QualityGuardConfig struct {
 	// RequestRetry withholds a thinking-model stream that already has enough
 	// visible output and no reasoning, then retries on another account.
 	RequestRetry QualityGuardRequestRetryConfig `yaml:"requestRetry"`
+	// AccountProbe periodically re-tests missing-thinking strike holders and
+	// cross-proxy suspects through the tmp-proxy pool and applies the strike
+	// machine: first hit cools the account, a post-cooldown hit disables it.
+	AccountProbe QualityGuardAccountProbeConfig `yaml:"accountProbe"`
+}
+
+// QualityGuardAccountProbeConfig configures the in-process account quality
+// probe scheduler.
+type QualityGuardAccountProbeConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// ClientKeyID selects the client key used for probe requests.
+	ClientKeyID uint64 `yaml:"clientKeyID"`
+	// Interval is the scan period. 1m-24h.
+	Interval Duration `yaml:"interval"`
+	// Model must be a Grok Build public model.
+	Model string `yaml:"model"`
+	// Prompt is the reasoning-eliciting probe question.
+	Prompt string `yaml:"prompt"`
+	MaxOutputTokens int `yaml:"maxOutputTokens"`
+	// MaxAccountsPerRun caps each scan batch.
+	MaxAccountsPerRun int `yaml:"maxAccountsPerRun"`
+	// CrossProxyWindow/Threshold select candidates whose real failures span
+	// at least `threshold` distinct egress nodes within the window.
+	CrossProxyWindow    Duration `yaml:"crossProxyWindow"`
+	CrossProxyThreshold int      `yaml:"crossProxyThreshold"`
+	// AccountCooldown overrides the strike cooldown; zero uses 12h.
+	AccountCooldown Duration `yaml:"accountCooldown"`
+	// SampleRetentionDays keeps quality-guard probe samples for the gallery;
+	// older samples are pruned on each scan. 1-90 days, zero uses 7.
+	SampleRetentionDays int `yaml:"sampleRetentionDays"`
 }
 
 // QualityGuardRequestRetryConfig holds the in-process missing-thinking withhold policy.
@@ -730,6 +760,9 @@ func validateQualityGuardConfig(value QualityGuardConfig) error {
 	if err := validateQualityGuardRequestRetry(value.RequestRetry); err != nil {
 		return err
 	}
+	if err := validateQualityGuardAccountProbe(value.AccountProbe); err != nil {
+		return err
+	}
 	if !value.Enabled {
 		return nil
 	}
@@ -804,6 +837,43 @@ func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) erro
 	}
 	if d := value.IdleAccountCooldown.Value(); d != 0 && (d < time.Minute || d > 168*time.Hour) {
 		return errors.New("qualityGuard.requestRetry.idleAccountCooldown 必须在 1m 到 168h 之间")
+	}
+	return nil
+}
+
+func validateQualityGuardAccountProbe(value QualityGuardAccountProbeConfig) error {
+	if !value.Enabled {
+		return nil
+	}
+	if value.ClientKeyID == 0 {
+		return errors.New("qualityGuard.accountProbe.clientKeyID 必须配置")
+	}
+	if d := value.Interval.Value(); d != 0 && (d < time.Minute || d > 24*time.Hour) {
+		return errors.New("qualityGuard.accountProbe.interval 必须在 1m 到 24h 之间")
+	}
+	if strings.TrimSpace(value.Model) == "" {
+		return errors.New("qualityGuard.accountProbe.model 不能为空")
+	}
+	if strings.TrimSpace(value.Prompt) == "" {
+		return errors.New("qualityGuard.accountProbe.prompt 不能为空")
+	}
+	if value.MaxOutputTokens != 0 && (value.MaxOutputTokens < 32 || value.MaxOutputTokens > 2048) {
+		return errors.New("qualityGuard.accountProbe.maxOutputTokens 必须在 32 到 2048 之间")
+	}
+	if value.MaxAccountsPerRun != 0 && (value.MaxAccountsPerRun < 1 || value.MaxAccountsPerRun > 100) {
+		return errors.New("qualityGuard.accountProbe.maxAccountsPerRun 必须在 1 到 100 之间")
+	}
+	if d := value.CrossProxyWindow.Value(); d != 0 && (d < 5*time.Minute || d > 7*24*time.Hour) {
+		return errors.New("qualityGuard.accountProbe.crossProxyWindow 必须在 5m 到 7d 之间")
+	}
+	if value.CrossProxyThreshold != 0 && (value.CrossProxyThreshold < 1 || value.CrossProxyThreshold > 20) {
+		return errors.New("qualityGuard.accountProbe.crossProxyThreshold 必须在 1 到 20 之间")
+	}
+	if d := value.AccountCooldown.Value(); d != 0 && (d < time.Minute || d > 168*time.Hour) {
+		return errors.New("qualityGuard.accountProbe.accountCooldown 必须在 1m 到 168h 之间")
+	}
+	if value.SampleRetentionDays != 0 && (value.SampleRetentionDays < 1 || value.SampleRetentionDays > 90) {
+		return errors.New("qualityGuard.accountProbe.sampleRetentionDays 必须在 1 到 90 之间")
 	}
 	return nil
 }
@@ -941,6 +1011,18 @@ func defaultConfig() Config {
 				Enabled: true,
 				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
 				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
+			},
+			AccountProbe: QualityGuardAccountProbeConfig{
+				Enabled:             false,
+				Interval:            Duration(30 * time.Minute),
+				Model:               "grok-4.6",
+				Prompt:              "A farmer has 17 sheep. All but 9 run away. How many sheep are left? Think step by step.",
+				MaxOutputTokens:     512,
+				MaxAccountsPerRun:   5,
+				CrossProxyWindow:    Duration(time.Hour),
+				CrossProxyThreshold: 3,
+				AccountCooldown:     Duration(12 * time.Hour),
+				SampleRetentionDays: 7,
 			},
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},

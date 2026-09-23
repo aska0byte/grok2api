@@ -26,6 +26,7 @@ import (
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
 	quotarecoveryapp "github.com/chenyme/grok2api/backend/internal/application/quotarecovery"
 	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
+	qualityguardapp "github.com/chenyme/grok2api/backend/internal/application/qualityguard"
 	updatecheckapp "github.com/chenyme/grok2api/backend/internal/application/updatecheck"
 	"github.com/chenyme/grok2api/backend/internal/buildinfo"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -357,6 +358,15 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	gatewayService.UpdateMarkBuildChatDeniedAsReauth(cfg.Routing.MarkBuildChatDeniedAsReauth)
 	gatewayService.SetLogger(logger)
 	egressService.SetQualityProber(gatewayService)
+	egressService.SetAccountController(gatewayService)
+	gatewayService.SetAccountProbeStrikes(accountRepo)
+	gatewayService.SetAccountProbeAudits(auditRepo)
+	gatewayService.SetAccountProbeNodes(egressService)
+	gatewayService.SetAccountProbeBoundAccounts(accountRepo)
+	probeSampleRepo := relational.NewProbeSampleRepository(database)
+	gatewayService.SetAccountProbeSamples(probeSampleRepo)
+	qualityGuardSamples := qualityguardapp.NewService(probeSampleRepo)
+	gatewayService.ApplyAccountProbeRuntime(accountProbeRuntime(cfg.QualityGuard.AccountProbe))
 	gatewayService.UpdateBuildForbiddenReauthPolicy(cfg.Accounts.MarkBuildForbiddenReauth, cfg.Accounts.BuildForbiddenReauthCodes)
 	gatewayService.UpdateRequestTimeout(cfg.Server.RequestTimeout.Value())
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
@@ -410,6 +420,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		reasoningReplay.UpdateConfig(reasoningreplay.Config{Enabled: next.Routing.ReasoningReplayEnabled, TTL: next.Routing.ReasoningReplayTTL.Value()})
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
 		gatewayService.UpdateQualityRetry(qualityRetryRuntime(next.QualityGuard.RequestRetry))
+		gatewayService.ApplyAccountProbeRuntime(accountProbeRuntime(next.QualityGuard.AccountProbe))
 		gatewayService.UpdateVideoMaxAttempts(next.Routing.VideoMaxAttempts)
 		gatewayService.UpdateMarkBuildChatDeniedAsReauth(next.Routing.MarkBuildChatDeniedAsReauth)
 		gatewayService.UpdateBuildForbiddenReauthPolicy(next.Accounts.MarkBuildForbiddenReauth, next.Accounts.BuildForbiddenReauthCodes)
@@ -432,7 +443,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 			MaxOutputTokens: cfg.QualityGuard.MaxOutputTokens,
 		}
 	}
-	router := httpserver.New(httpserver.Dependencies{Logger: logger, RequestTimeout: cfg.Server.RequestTimeout.Value(), MaxBodyBytes: cfg.Server.MaxBodyBytes, TrustedProxies: cfg.Server.TrustedProxies, ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies, SwaggerEnabled: cfg.Server.SwaggerEnabled, PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath, Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService, AccountSync: accountSyncService, Models: modelService, ClientKeys: clientKeyService, Audits: auditService, Dashboard: dashboardService, Gateway: gatewayService, Media: mediaService, Settings: settingsService, Egress: egressService, QualityGuardStatePath: qualityGuardPath("state.json"), QualityGuardConfigPath: qualityGuardPath("runtime-config.json"), QualityGuardToken: qualityGuardToken, QualityGuardProbe: qualityGuardProbe, Updates: updateService})
+	router := httpserver.New(httpserver.Dependencies{Logger: logger, RequestTimeout: cfg.Server.RequestTimeout.Value(), MaxBodyBytes: cfg.Server.MaxBodyBytes, TrustedProxies: cfg.Server.TrustedProxies, ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies, SwaggerEnabled: cfg.Server.SwaggerEnabled, PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath, Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService, AccountSync: accountSyncService, Models: modelService, ClientKeys: clientKeyService, Audits: auditService, Dashboard: dashboardService, Gateway: gatewayService, Media: mediaService, Settings: settingsService, Egress: egressService, ProbeSamples: qualityGuardSamples, QualityGuardStatePath: qualityGuardPath("state.json"), QualityGuardConfigPath: qualityGuardPath("runtime-config.json"), QualityGuardToken: qualityGuardToken, QualityGuardProbe: qualityGuardProbe, Updates: updateService})
 	server := &http.Server{Addr: cfg.Server.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: cfg.Server.ReadTimeout.Value(), IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	return &Application{
 		logger: logger, database: database, server: server,
@@ -498,6 +509,22 @@ func qualityRetryRuntime(value config.QualityGuardRequestRetryConfig) gateway.Qu
 		OnExhausted:         value.OnExhausted,
 		AccountCooldown:     value.AccountCooldown.Value(),
 		IdleAccountCooldown: value.IdleAccountCooldown.Value(),
+	}
+}
+
+func accountProbeRuntime(value config.QualityGuardAccountProbeConfig) gateway.AccountProbeRuntime {
+	return gateway.AccountProbeRuntime{
+		Enabled:             value.Enabled,
+		ClientKeyID:         value.ClientKeyID,
+		Interval:            value.Interval.Value(),
+		Model:               value.Model,
+		Prompt:              value.Prompt,
+		MaxOutputTokens:     value.MaxOutputTokens,
+		MaxAccountsPerRun:   value.MaxAccountsPerRun,
+		CrossProxyWindow:    value.CrossProxyWindow.Value(),
+		CrossProxyThreshold: value.CrossProxyThreshold,
+		AccountCooldown:     value.AccountCooldown.Value(),
+		SampleRetention:     time.Duration(value.SampleRetentionDays) * 24 * time.Hour,
 	}
 }
 
@@ -655,6 +682,11 @@ func (a *Application) Run(ctx context.Context) error {
 			a.logger.Warn("egress_operations_initial_run_failed", "error", err)
 		}
 		a.runPeriodicTask(taskCtx, time.Minute, "egress_operations", a.egressOps.RunMaintenance)
+		return nil
+	})
+	startBackground("account_probe", func(taskCtx context.Context) error {
+		a.gateway.RunAccountProbeScan(taskCtx)
+		a.runPeriodicTask(taskCtx, time.Minute, "account_probe", a.gateway.RunAccountProbeScan)
 		return nil
 	})
 	if a.settingsBus != nil {

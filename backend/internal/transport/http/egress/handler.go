@@ -87,6 +87,12 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/egress-operations", h.operationsConfig)
 	router.PUT("/egress-operations", h.updateOperationsConfig)
 	router.POST("/egress-operations/rebalance", h.rebalance)
+	router.GET("/egress-operations/nodes/:id/accounts", h.nodeAccounts)
+	router.POST("/egress-operations/accounts/:id/quality-probe", h.probeAccountQuality)
+	router.POST("/egress-operations/accounts/:id/quarantine", h.quarantineAccount)
+	router.POST("/egress-operations/accounts/:id/restore", h.restoreAccount)
+	router.POST("/egress-operations/account-controls/quarantine", h.quarantineAccounts)
+	router.POST("/egress-operations/account-controls/quality-probe-batch", h.probeAccountsQualityBatch)
 }
 
 // RegisterQualityGuard exposes the minimum egress surface required by the
@@ -188,7 +194,7 @@ type qualityGuardEvent struct {
 func (h *Handler) qualityGuardStatus(c *gin.Context) {
 	state, available, err := h.readQualityGuardState()
 	if !available {
-		response.Success(c, http.StatusOK, gin.H{"available": false})
+		response.Success(c, http.StatusOK, gin.H{"available": false, "enabled": h.qualityGuardRuntimeEnabled()})
 		return
 	}
 	if err != nil {
@@ -198,6 +204,7 @@ func (h *Handler) qualityGuardStatus(c *gin.Context) {
 	payload := gin.H{
 		"available":         true,
 		"editable":          h.guardConfigPath != "",
+		"enabled":           h.qualityGuardRuntimeEnabled(),
 		"startedAt":         state.StartedAt,
 		"updatedAt":         state.UpdatedAt,
 		"lastActiveCycleAt": state.LastActiveCycleAt,
@@ -233,6 +240,7 @@ type qualityGuardConfigRequest struct {
 	ConsecutiveErrors     int     `json:"consecutiveErrors"`
 	QuarantineSeconds     int     `json:"quarantineSeconds"`
 	MinHealthyNodes       int     `json:"minHealthyNodes"`
+	Enabled               *bool   `json:"enabled"`
 }
 
 type qualityGuardRuntimeConfigFile struct {
@@ -250,6 +258,7 @@ type qualityGuardRuntimeConfigSettings struct {
 	ConsecutiveErrors     int     `json:"consecutive_errors"`
 	QuarantineSeconds     int     `json:"quarantine_seconds"`
 	MinHealthyNodes       int     `json:"min_healthy_nodes"`
+	Enabled               *bool   `json:"enabled"`
 }
 
 func (h *Handler) updateQualityGuardConfig(c *gin.Context) {
@@ -273,17 +282,36 @@ func (h *Handler) updateQualityGuardConfig(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidQualityGuardConfig", err.Error())
 		return
 	}
+	enabled := request.Enabled == nil || *request.Enabled
 	value := qualityGuardRuntimeConfigFile{Version: 1, Settings: qualityGuardRuntimeConfigSettings{
 		Mode: request.Mode, ActiveIntervalSeconds: request.ActiveIntervalSeconds,
 		PassivePollSeconds: request.PassivePollSeconds, SoftTPS: request.SoftTPS, HardTPS: request.HardTPS,
 		ConsecutiveSoft: request.ConsecutiveSoft, ConsecutiveErrors: request.ConsecutiveErrors,
 		QuarantineSeconds: request.QuarantineSeconds, MinHealthyNodes: request.MinHealthyNodes,
+		Enabled: &enabled,
 	}}
 	if err := saveQualityGuardRuntimeConfig(h.guardConfigPath, value); err != nil {
 		response.Error(c, http.StatusServiceUnavailable, "qualityGuardConfigWriteFailed", "质量守护策略保存失败")
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{"saved": true})
+}
+
+// qualityGuardRuntimeEnabled reports the operator-managed global switch from
+// the guard runtime config file; missing or unreadable files default to true.
+func (h *Handler) qualityGuardRuntimeEnabled() bool {
+	if h.guardConfigPath == "" {
+		return true
+	}
+	data, err := os.ReadFile(h.guardConfigPath)
+	if err != nil {
+		return true
+	}
+	var value qualityGuardRuntimeConfigFile
+	if json.Unmarshal(data, &value) != nil || value.Settings.Enabled == nil {
+		return true
+	}
+	return *value.Settings.Enabled
 }
 
 func (r qualityGuardConfigRequest) validate(nodeCount int) error {
@@ -450,6 +478,7 @@ type nodeRequest struct {
 	Scope             string  `json:"scope"`
 	Enabled           bool    `json:"enabled"`
 	ProxyPool         *bool   `json:"proxyPool"`
+	Usage             string  `json:"usage"`
 	AccountCapacity   *int    `json:"accountCapacity"`
 	ProxyURL          *string `json:"proxyURL"`
 	ProxyProfileID    *uint64 `json:"proxyProfileId,string"`
@@ -468,6 +497,7 @@ type nodeResponse struct {
 	ProxyDisplay         string              `json:"proxyDisplay,omitempty"`
 	ProxyFingerprint     string              `json:"proxyFingerprint,omitempty"`
 	ProxyPool            bool                `json:"proxyPool"`
+	Usage                string              `json:"usage"`
 	SourceID             uint64              `json:"sourceId,omitempty,string"`
 	ProxyProfileID       uint64              `json:"proxyProfileId,omitempty,string"`
 	ProxyProfileName     string              `json:"proxyProfileName,omitempty"`
@@ -557,6 +587,241 @@ func (h *Handler) testQuality(c *gin.Context) {
 	})
 }
 
+// accountQualityProbeBatchRequest starts a server-side batch probe task over
+// explicit account IDs with a bounded worker pool (server caps at 4).
+type accountQualityProbeBatchRequest struct {
+	AccountIDs  []uint64 `json:"accountIds"`
+	Kind        string   `json:"kind"`
+	Concurrency int      `json:"concurrency"`
+}
+
+// egressBatchEventStream writes the same SSE frame format as the account task
+// streams so the shared frontend event parser can consume batch progress.
+type egressBatchEventStream struct {
+	context *gin.Context
+	mu      sync.Mutex
+}
+
+func newEgressBatchEventStream(c *gin.Context) *egressBatchEventStream {
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	c.Writer.WriteHeader(http.StatusOK)
+	c.Writer.Flush()
+	return &egressBatchEventStream{context: c}
+}
+
+func (s *egressBatchEventStream) Write(event string, value any) error {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := fmt.Fprintf(s.context.Writer, "event: %s\ndata: %s\n\n", event, payload); err != nil {
+		return err
+	}
+	s.context.Writer.Flush()
+	return nil
+}
+
+// probeAccountsQualityBatch runs the batch probe as an SSE task: progress and
+// per-account item events stream back live and client disconnect cancels the
+// remaining dispatches through the request context.
+func (h *Handler) probeAccountsQualityBatch(c *gin.Context) {
+	var request accountQualityProbeBatchRequest
+	if c.Request.Body == nil || c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	if len(request.AccountIDs) == 0 {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "accountIds 必填")
+		return
+	}
+	stream := newEgressBatchEventStream(c)
+	_ = stream.Write("progress", gin.H{"completed": 0, "total": len(request.AccountIDs)})
+	succeeded, failed, err := h.service.RunAccountQualityProbeBatch(c.Request.Context(), request.AccountIDs, request.Kind, request.Concurrency,
+		func(completed, total int) {
+			_ = stream.Write("progress", gin.H{"completed": completed, "total": total})
+		},
+		func(item egressapp.AccountQualityBatchItem) {
+			_ = stream.Write("item", gin.H{
+				"id": strconv.FormatUint(item.AccountID, 10), "outcome": item.Outcome,
+				"missingThinking": item.MissingThinking, "action": item.Action,
+				"overturned": item.Overturned, "reason": item.Reason,
+			})
+		})
+	if err != nil && c.Request.Context().Err() == nil {
+		_ = stream.Write("error", gin.H{"code": "accountProbeBatchFailed", "message": err.Error()})
+		return
+	}
+	_ = stream.Write("complete", gin.H{"succeeded": succeeded, "failed": failed})
+}
+
+// probeAccountQuality pins a one-shot probe request to a single account and
+// rotates through the tmp-proxy pool (nodeID=0). The body is optional: with
+// no clientKeyID/model, the configured account-probe runtime fills the gap.
+// The verdict feeds the missing-thinking strike machine: first hit cools the
+// account, a second hit after the cooldown disables it.
+// accountQualityProbeRequest is fully optional: empty bodies (the UI probe
+// button) fall back to configured defaults and the built-in probe identity.
+type accountQualityProbeRequest struct {
+	ClientKeyID     string `json:"clientKeyId"`
+	Model           string `json:"model"`
+	Prompt          string `json:"prompt"`
+	Expected        string `json:"expected"`
+	MaxOutputTokens int    `json:"maxOutputTokens"`
+	Kind            string `json:"kind"`
+}
+
+func (h *Handler) probeAccountQuality(c *gin.Context) {
+	accountID, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var request accountQualityProbeRequest
+	if c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if c.ShouldBindJSON(&request) != nil {
+			response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+			return
+		}
+	}
+	var clientKeyID uint64
+	if strings.TrimSpace(request.ClientKeyID) != "" {
+		parsed, err := strconv.ParseUint(request.ClientKeyID, 10, 64)
+		if err != nil || parsed == 0 {
+			response.Error(c, http.StatusBadRequest, "invalidClientKeyId", "Client Key ID 无效")
+			return
+		}
+		clientKeyID = parsed
+	}
+	value, err := h.service.ProbeAccountQuality(c.Request.Context(), accountID, 0, egressapp.QualityProbeInput{
+		ClientKeyID: clientKeyID, Model: request.Model, Prompt: request.Prompt,
+		Expected: request.Expected, MaxOutputTokens: request.MaxOutputTokens,
+		Kind: request.Kind,
+	})
+	if err != nil {
+		h.writeQualityProbeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"requestId": value.RequestID, "accountId": strconv.FormatUint(value.AccountID, 10), "nodeId": strconv.FormatUint(value.NodeID, 10),
+		"model": value.Model, "statusCode": value.StatusCode, "firstTokenMs": value.FirstTokenMS, "durationMs": value.DurationMS,
+		"kind": value.Kind,
+		"outputTokens": value.OutputTokens, "reasoningTokens": value.ReasoningTokens,
+		"visibleCharacters":     value.VisibleCharacters,
+		"outputTokensPerSecond": value.OutputTokensPerSecond,
+		"thinkingObserved":      value.ThinkingObserved, "missingThinking": value.MissingThinking, "action": value.Action,
+		"overturned": value.Overturned, "confirmation": qualityAccountProbeConfirmationJSON(value.Confirmation),
+	})
+}
+
+// accountCooldownRequest carries the operator-ordered isolation duration in
+// hours (1h..7d).
+type accountCooldownRequest struct {
+	Hours float64 `json:"hours"`
+}
+
+// quarantineAccount applies an operator-ordered cooldown to one account:
+// it leaves rotation until the chosen duration expires, preserving failure
+// counts and strike history.
+func (h *Handler) quarantineAccount(c *gin.Context) {
+	accountID, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var request accountCooldownRequest
+	if c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if c.ShouldBindJSON(&request) != nil {
+			response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+			return
+		}
+	}
+	if request.Hours <= 0 || request.Hours > 24*7 {
+		response.Error(c, http.StatusBadRequest, "invalidQuarantineHours", "隔离时长必须在 1 小时到 7 天之间")
+		return
+	}
+	if err := h.service.QuarantineAccount(c.Request.Context(), accountID, time.Duration(request.Hours*float64(time.Hour))); err != nil {
+		h.writeAccountControlError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"quarantined": true})
+}
+
+// restoreAccount re-enables one account and clears its cooldown, strike
+// marker, and failure backoff.
+func (h *Handler) restoreAccount(c *gin.Context) {
+	accountID, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if err := h.service.RestoreAccount(c.Request.Context(), accountID); err != nil {
+		h.writeAccountControlError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"restored": true})
+}
+
+// accountCooldownsRequest carries a batch operator-ordered cooldown: the
+// target account IDs and the shared duration in hours (1h..7d).
+type accountCooldownsRequest struct {
+	AccountIDs []uint64 `json:"accountIds"`
+	Hours      float64  `json:"hours"`
+}
+
+// quarantineAccounts applies the same operator-ordered cooldown to many
+// accounts at once and reports which IDs were not found.
+func (h *Handler) quarantineAccounts(c *gin.Context) {
+	var request accountCooldownsRequest
+	if c.Request.Body == nil || c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	if len(request.AccountIDs) == 0 {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "accountIds 必填")
+		return
+	}
+	if request.Hours <= 0 || request.Hours > 24*7 {
+		response.Error(c, http.StatusBadRequest, "invalidQuarantineHours", "隔离时长必须在 1 小时到 7 天之间")
+		return
+	}
+	quarantined, missing, err := h.service.QuarantineAccounts(c.Request.Context(), request.AccountIDs, time.Duration(request.Hours*float64(time.Hour)))
+	if err != nil {
+		h.writeAccountControlError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"quarantined": quarantined, "missing": missing})
+}
+
+func (h *Handler) writeAccountControlError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, egressapp.ErrAccountControlUnavailable):
+		response.Error(c, http.StatusServiceUnavailable, "egressAccountControlUnavailable", err.Error())
+	case errors.Is(err, egressapp.ErrInvalidInput):
+		response.Error(c, http.StatusBadRequest, "invalidRequest", err.Error())
+	case errors.Is(err, repository.ErrNotFound):
+		response.Error(c, http.StatusNotFound, "egressAccountNotFound", "账号不存在")
+	default:
+		response.Error(c, http.StatusBadGateway, "egressAccountControlFailed", err.Error())
+	}
+}
+
+// qualityAccountProbeConfirmationJSON exposes the second-chance tmp-proxy
+// re-test outcome; nil JSON when no confirmation round ran.
+func qualityAccountProbeConfirmationJSON(value *egressapp.AccountQualityProbeResult) any {
+	if value == nil {
+		return nil
+	}
+	return gin.H{
+		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10),
+		"statusCode": value.StatusCode, "firstTokenMs": value.FirstTokenMS, "durationMs": value.DurationMS,
+		"outputTokens": value.OutputTokens, "reasoningTokens": value.ReasoningTokens,
+		"visibleCharacters":     value.VisibleCharacters,
+		"outputTokensPerSecond": value.OutputTokensPerSecond,
+		"thinkingObserved":      value.ThinkingObserved, "missingThinking": value.MissingThinking,
+	}
+}
+
 func (h *Handler) updateMany(c *gin.Context) {
 	var request batchNodeUpdateRequest
 	if c.ShouldBindJSON(&request) != nil {
@@ -644,9 +909,10 @@ func (h *Handler) unassignAccounts(c *gin.Context) {
 func (value nodeRequest) input() egressapp.Input {
 	return egressapp.Input{
 		Name: value.Name, Scope: egressdomain.Scope(value.Scope), Enabled: value.Enabled, ProxyPool: value.ProxyPool,
-		AccountCapacity: value.AccountCapacity,
-		ProxyURL:        value.ProxyURL, ProxyProfileID: value.ProxyProfileID,
-		ClearProxyURL: value.ClearProxyURL, UserAgent: value.UserAgent,
+		Usage:            egressdomain.Usage(value.Usage),
+		AccountCapacity:  value.AccountCapacity,
+		ProxyURL:         value.ProxyURL, ProxyProfileID: value.ProxyProfileID,
+		ClearProxyURL:    value.ClearProxyURL, UserAgent: value.UserAgent,
 		CloudflareCookies: value.CloudflareCookies, ClearCookies: value.ClearCookies,
 	}
 }
@@ -673,7 +939,8 @@ func (h *Handler) list(c *gin.Context) {
 	page, pageSize := nodePagination(c)
 	values, total, err := h.service.List(c.Request.Context(), page, pageSize, c.Query("search"), egressapp.ListFilter{
 		Scope: scope, Enabled: c.Query("enabled"), ProbeStatus: c.Query("probe"), Assignment: c.Query("assignment"),
-		Sort: sort,
+		Usage: egressdomain.Usage(c.Query("usage")),
+		Sort:  sort,
 	})
 	if h.writeListError(c, err) {
 		return
@@ -875,6 +1142,7 @@ func newNodeResponse(value egressdomain.PublicNode) nodeResponse {
 		ID: value.ID, Name: value.Name, Scope: string(value.Scope), Enabled: value.Enabled,
 		ProxyConfigured: value.ProxyConfigured, ProxyDisplay: value.ProxyDisplay, ProxyFingerprint: value.ProxyFingerprint,
 		ProxyPool: value.ProxyPool, UserAgent: value.UserAgent, CookieConfigured: value.CookieConfigured,
+		Usage:             string(value.Usage.Normalize()),
 		AccountBoundProxy: value.AccountBoundProxy,
 		SourceID:          value.SourceID, AccountCapacity: value.AccountCapacity,
 		ProxyProfileID: value.ProxyProfileID, ProxyProfileName: value.ProxyProfileName,
@@ -991,6 +1259,7 @@ type importRequest struct {
 	Name            string `json:"name"`
 	Scope           string `json:"scope"`
 	AccountCapacity int    `json:"accountCapacity"`
+	Usage           string `json:"usage"`
 	Content         string `json:"content"`
 }
 
@@ -1004,6 +1273,7 @@ type operationsConfigRequest struct {
 	AutoAssignEnabled         bool                                 `json:"autoAssignEnabled"`
 	AutoBalanceEnabled        bool                                 `json:"autoBalanceEnabled"`
 	AssignmentIntervalSeconds int                                  `json:"assignmentIntervalSeconds"`
+	ProbeNodeLimit            *int                                 `json:"probeNodeLimit"`
 	Fallbacks                 map[string]operationsFallbackRequest `json:"fallbacks"`
 }
 
@@ -1018,6 +1288,7 @@ type operationsConfigResponse struct {
 	AutoAssignEnabled         bool                                  `json:"autoAssignEnabled"`
 	AutoBalanceEnabled        bool                                  `json:"autoBalanceEnabled"`
 	AssignmentIntervalSeconds int                                   `json:"assignmentIntervalSeconds"`
+	ProbeNodeLimit            int                                   `json:"probeNodeLimit"`
 	Fallbacks                 map[string]operationsFallbackResponse `json:"fallbacks"`
 	UpdatedAt                 time.Time                             `json:"updatedAt"`
 }
@@ -1031,6 +1302,7 @@ func (value operationsConfigRequest) input() (egressapp.OperationsConfigInput, e
 	result := egressapp.OperationsConfigInput{
 		ProbeProvider: egressdomain.ProbeProvider(strings.TrimSpace(value.ProbeProvider)), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
+		ProbeNodeLimit: value.ProbeNodeLimit,
 	}
 	if value.Fallbacks == nil {
 		return result, nil
@@ -1082,6 +1354,7 @@ func newOperationsConfigResponse(value egressdomain.OperationsConfig) operations
 	return operationsConfigResponse{
 		ProbeProvider: string(value.ProbeProvider.Normalized()), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
+		ProbeNodeLimit: value.ProbeNodeLimit,
 		Fallbacks: fallbacks, UpdatedAt: value.UpdatedAt,
 	}
 }
@@ -1200,13 +1473,14 @@ func (h *Handler) importText(c *gin.Context) {
 		return
 	}
 	value, err := h.service.ImportText(c.Request.Context(), egressapp.ImportInput{
-		Name: request.Name, Scope: egressdomain.Scope(request.Scope), AccountCapacity: request.AccountCapacity, Content: request.Content,
+		Name: request.Name, Scope: egressdomain.Scope(request.Scope), AccountCapacity: request.AccountCapacity,
+		Usage: egressdomain.Usage(request.Usage), Content: request.Content,
 	})
 	if err != nil {
 		h.writeError(c, err)
 		return
 	}
-	response.Success(c, http.StatusCreated, gin.H{"imported": value.Imported, "skipped": value.Skipped})
+	response.Success(c, http.StatusCreated, gin.H{"imported": value.Imported, "skipped": value.Skipped, "replaced": value.Replaced})
 }
 
 func (h *Handler) testNode(c *gin.Context) {
@@ -1284,7 +1558,34 @@ func (h *Handler) rebalance(c *gin.Context) {
 		h.writeError(c, err)
 		return
 	}
-	response.Success(c, http.StatusOK, gin.H{"assigned": value.Assigned, "rebalanced": value.Rebalanced, "unplaced": value.Unplaced})
+	response.Success(c, http.StatusOK, gin.H{
+		"assigned": value.Assigned, "rebalanced": value.Rebalanced, "released": value.Released, "unplaced": value.Unplaced,
+		"nodes": gin.H{
+			"total": value.Nodes.Total, "healthy": value.Nodes.Healthy, "unprobed": value.Nodes.Unprobed,
+			"unhealthy": value.Nodes.Unhealthy, "cooldown": value.Nodes.Cooldown, "disabled": value.Nodes.Disabled,
+		},
+	})
+}
+
+func (h *Handler) nodeAccounts(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 {
+		h.writeError(c, egressapp.ErrInvalidInput)
+		return
+	}
+	accounts, err := h.service.ListNodeAccounts(c.Request.Context(), id)
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	items := make([]gin.H, 0, len(accounts))
+	for _, account := range accounts {
+		items = append(items, gin.H{
+			"id": account.ID, "provider": string(account.Provider), "name": account.Name, "email": account.Email,
+			"enabled": account.Enabled, "authStatus": account.AuthStatus, "assignmentMode": account.AssignmentMode,
+		})
+	}
+	response.Success(c, http.StatusOK, gin.H{"accounts": items})
 }
 
 func parseOptionalAccountIDs(values []string) ([]uint64, error) {
@@ -1328,13 +1629,17 @@ func (h *Handler) writeError(c *gin.Context, err error) {
 func (h *Handler) writeQualityProbeError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, egressapp.ErrQualityProbeNoAccount):
-		response.Error(c, http.StatusServiceUnavailable, "egressQualityProbeNoAccount", "质量检测暂无可调度账号，请稍后重试")
+		// dynamic text: carries the concrete scheduling blocker (quota,
+		// cooling, disabled...) appended by the gateway prober
+		response.Error(c, http.StatusServiceUnavailable, "egressQualityProbeNoAccount", err.Error())
 	case errors.Is(err, egressapp.ErrInvalidInput),
 		errors.Is(err, egressapp.ErrNotFound),
 		errors.Is(err, egressapp.ErrQualityProbeUnavailable):
 		h.writeError(c, err)
 	default:
-		response.Error(c, http.StatusBadGateway, "egressQualityProbeFailed", "质量检测暂不可用，请稍后重试")
+		// Surface the underlying cause (upstream status, proxy dial, stream
+		// errors...) instead of a generic message; the probe dialog shows it.
+		response.Error(c, http.StatusBadGateway, "egressQualityProbeFailed", err.Error())
 	}
 }
 

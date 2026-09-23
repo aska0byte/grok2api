@@ -232,7 +232,7 @@ type ListAccountsInput = {
   sortOrder?: SortOrder;
 };
 
-export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<AccountDTO>> {
+export function listAccounts(input: ListAccountsInput, signal?: AbortSignal): Promise<PaginatedDTO<AccountDTO>> {
   const query = new URLSearchParams({ page: String(input.page), pageSize: String(input.pageSize) });
   if (input.search) query.set("search", input.search);
   if (input.type) query.set("type", input.type);
@@ -247,7 +247,7 @@ export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<Acc
     query.set("sortOrder", input.sortOrder);
   }
   if (input.provider) query.set("provider", input.provider);
-  return apiRequest(`/api/admin/v1/accounts?${query}`, {}, decodeAccountPage);
+  return apiRequest(`/api/admin/v1/accounts?${query}`, { signal }, decodeAccountPage);
 }
 
 export function getAccountSummary(): Promise<AccountSummaryDTO> {
@@ -396,6 +396,9 @@ type AccountTaskStreamPayload = Partial<BuildConversionResultDTO & AccountTaskPr
   id?: string;
   name?: string;
   email?: string;
+  missingThinking?: boolean;
+  action?: string;
+  overturned?: boolean;
 };
 
 const decodeAccountTaskStreamPayload = createObjectDecoder<AccountTaskStreamPayload>("account task event", {
@@ -405,6 +408,7 @@ const decodeAccountTaskStreamPayload = createObjectDecoder<AccountTaskStreamPayl
   code: isOptional(isString), message: isOptional(isString),
   id: isOptional(isString), name: isOptional(isString), email: isOptional(isString),
   outcome: isOptional(isOneOf("ok", "invalid", "failed")), reason: isOptional(isString), httpStatus: isOptional(isNumber),
+  missingThinking: isOptional(isBoolean), action: isOptional(isString), overturned: isOptional(isBoolean),
 });
 
 function hasNumericResult(value: AccountTaskStreamPayload, fields: string[]): boolean {
@@ -517,6 +521,71 @@ async function runDetectBuildAccountsTask(body: object, handlers: BuildDetectHan
 
 export function refreshAllAccountTokens(onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountTokenRefreshResultDTO> {
   return runAccountTask("/api/admin/v1/accounts/refresh-tokens", undefined, ["succeeded", "failed", "skipped"], { onProgress, signal });
+}
+
+export type ProbeAccountsQualityBatchItem = {
+  id: string;
+  outcome: "ok" | "failed";
+  missingThinking?: boolean;
+  action?: string;
+  overturned?: boolean;
+  reason?: string;
+};
+
+export type ProbeAccountsQualityBatchHandlers = {
+  onProgress?: (value: AccountTaskProgressDTO) => void;
+  onItem?: (item: ProbeAccountsQualityBatchItem) => void;
+};
+
+// Batch quality probes run as a server-side task over one SSE connection so
+// the browser no longer holds one long request per account; aborting the
+// signal cancels the remaining server-side dispatches.
+export function probeAccountsQualityBatch(input: { ids: string[]; kind: "text" | "html"; concurrency: number }, handlers: ProbeAccountsQualityBatchHandlers = {}, signal?: AbortSignal): Promise<{ succeeded: number; failed: number }> {
+  let result: { succeeded: number; failed: number } | undefined;
+  const progress = createAccountTaskProgressController({ onProgress: handlers.onProgress });
+  const body = { accountIds: input.ids, kind: input.kind, concurrency: input.concurrency };
+  const promise = (async () => {
+    try {
+      await apiEventStream("/api/admin/v1/egress-operations/account-controls/quality-probe-batch", {
+        method: "POST",
+        headers: { Accept: "text/event-stream" },
+        body,
+        signal,
+      }, decodeAccountTaskStreamPayload, ({ event, data }) => {
+        if (event === "progress" && typeof data.completed === "number" && typeof data.total === "number") {
+          progress.report({ completed: data.completed, total: data.total });
+          return;
+        }
+        if (event === "item" && typeof data.id === "string" && (data.outcome === "ok" || data.outcome === "failed")) {
+          handlers.onItem?.({
+            id: data.id,
+            outcome: data.outcome,
+            missingThinking: data.missingThinking === true ? true : undefined,
+            action: data.action,
+            overturned: data.overturned === true ? true : undefined,
+            reason: data.reason,
+          });
+          return;
+        }
+        if (event === "complete") {
+          progress.flush();
+          if (hasNumericResult(data, ["succeeded", "failed"])) result = data as { succeeded: number; failed: number };
+          return;
+        }
+        if (event === "error") {
+          const code = data.code ?? "accountProbeBatchFailed";
+          throw new ApiError(502, code, i18n.exists(`apiErrors.${code}`) ? i18n.t(`apiErrors.${code}`) : (data.message ?? i18n.t("apiErrors.requestFailed")));
+        }
+      });
+    } finally {
+      progress.dispose();
+    }
+    if (!result) {
+      throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
+    }
+    return result;
+  })();
+  return promise;
 }
 
 export function refreshAllWebAccountQuotas(onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountBatchResultDTO> {

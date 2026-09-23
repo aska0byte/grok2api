@@ -22,12 +22,31 @@ const (
 	ScopeConsoleAsset Scope = "grok_console_asset"
 )
 
+type Usage string
+
+const (
+	UsageProduction Usage = "production"
+	UsageProbe      Usage = "probe"
+)
+
+func (u Usage) IsValid() bool {
+	return u == UsageProduction || u == UsageProbe
+}
+
+func (u Usage) Normalize() Usage {
+	if u.IsValid() {
+		return u
+	}
+	return UsageProduction
+}
+
 type Node struct {
 	ID                          uint64
 	Name                        string
 	Scope                       Scope
 	Enabled                     bool
 	ProxyPool                   bool
+	Usage                       Usage
 	SourceID                    uint64
 	SourceKey                   string
 	AccountCapacity             int
@@ -65,6 +84,7 @@ type PublicNode struct {
 	ProxyDisplay         string
 	ProxyFingerprint     string
 	ProxyPool            bool
+	Usage                Usage
 	SourceID             uint64
 	AccountCapacity      int
 	ProxyProfileID       uint64
@@ -247,6 +267,7 @@ type OperationsConfig struct {
 	AutoAssignEnabled         bool
 	AutoBalanceEnabled        bool
 	AssignmentIntervalSeconds int
+	ProbeNodeLimit            int
 	Fallbacks                 map[Scope]FallbackConfig
 	UpdatedAt                 time.Time
 }
@@ -256,6 +277,7 @@ func DefaultOperationsConfig() OperationsConfig {
 		ProbeProvider:             ProbeProviderCloudflare,
 		ProbeIntervalSeconds:      900,
 		AssignmentIntervalSeconds: 300,
+		ProbeNodeLimit:            100,
 		Fallbacks: map[Scope]FallbackConfig{
 			ScopeBuild:        {Mode: FallbackModeNone},
 			ScopeWeb:          {Mode: FallbackModeNone},

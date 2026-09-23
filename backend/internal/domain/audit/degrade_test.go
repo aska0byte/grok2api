@@ -62,3 +62,27 @@ func TestGenerationWindowMSFallsBackOnlyWithReasoningEvidence(t *testing.T) {
 		t.Fatalf("tail at least 1s keeps after-first-token window: %d", got)
 	}
 }
+
+func TestGenerationWindowMSObservedUsesExplicitEvidence(t *testing.T) {
+	// Stub-only buffered flush: usage reports zero reasoning tokens but the
+	// parser saw the reasoning-start stub, so the full-duration fallback
+	// applies exactly as if reasoning tokens had been reported.
+	if got := GenerationWindowMSObserved(7900, 8300, true); got != 8300 {
+		t.Fatalf("stub evidence window = %d, want full duration 8300", got)
+	}
+	if got := GenerationWindowMSObserved(7900, 8300, false); got != 400 {
+		t.Fatalf("no-evidence window = %d, want tail 400", got)
+	}
+	if got := GenerationWindowMSObserved(19763, 19827, false); got != 64 {
+		t.Fatalf("no-evidence late first token window = %d, want 64", got)
+	}
+	if got := GenerationWindowMSObserved(200, 2200, true); got != 2000 {
+		t.Fatalf("evidence normal window = %d, want 2000", got)
+	}
+	if got := GenerationWindowMSObserved(2000, 3500, true); got != 1500 {
+		t.Fatalf("evidence think-then-write window = %d, want 1500", got)
+	}
+	if got := OutputTokensPerSecondObserved(300, 0, 7900, 8300, true); got != float64(300)*1000/8300 {
+		t.Fatalf("observed TPS = %v", got)
+	}
+}

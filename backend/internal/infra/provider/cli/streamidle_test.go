@@ -200,6 +200,42 @@ func TestEgressTransportScopesIdleTimeoutToEventStreams(t *testing.T) {
 	cancel(nil)
 }
 
+func TestEgressTransportQualityProbeGetsWideIdleWindow(t *testing.T) {
+	manager := infraegress.NewManager(emptyEgressRepository{}, nil)
+	manager.UpdateBuildStreamIdleTimeout(30 * time.Millisecond)
+	transport := &egressTransport{manager: manager, fallback: http.DefaultTransport}
+
+	request, err := http.NewRequest(http.MethodPost, "https://example.invalid/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Accept", "text/event-stream")
+	request = request.WithContext(infraegress.WithQualityProbe(request.Context()))
+
+	got := transport.withStreamIdleContext(request)
+	if got == request {
+		t.Fatal("quality probe request did not receive a stream idle timeout context")
+	}
+	idle, cancel := idleCancelFrom(got.Context())
+	if idle != qualityProbeStreamIdleTimeout || cancel == nil {
+		t.Fatalf("probe idle context = (%s, %v), want (%s, non-nil)", idle, cancel, qualityProbeStreamIdleTimeout)
+	}
+	cancel(nil)
+}
+
+func TestEffectiveStreamIdleTimeoutFollowsProbeContext(t *testing.T) {
+	base := 45 * time.Second
+	if got := effectiveStreamIdleTimeout(base, context.Background()); got != base {
+		t.Fatalf("normal context idle = %s, want %s", got, base)
+	}
+	if got := effectiveStreamIdleTimeout(base, nil); got != base {
+		t.Fatalf("nil context idle = %s, want %s", got, base)
+	}
+	if got := effectiveStreamIdleTimeout(base, infraegress.WithQualityProbe(context.Background())); got != qualityProbeStreamIdleTimeout {
+		t.Fatalf("probe context idle = %s, want %s", got, qualityProbeStreamIdleTimeout)
+	}
+}
+
 func TestEgressTransportIdleTimeoutCancelsHTTP2BodyRead(t *testing.T) {
 	requestCanceled := make(chan struct{})
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

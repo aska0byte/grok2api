@@ -53,6 +53,7 @@ var schemaModels = []any{
 	&mediaAssetModel{},
 	&mediaUploadTicketModel{},
 	&runtimeSettingsModel{},
+	&qualityProbeSampleModel{},
 }
 
 var schemaIndexes = []string{
@@ -113,6 +114,8 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_result_asset ON media_jobs(result_asset_id) WHERE result_asset_id <> ''",
 	// Pending input metadata rows only; keeps startup backfill scans off the full table after migration completes.
 	mediaJobInputMetadataPendingIndex,
+	"CREATE INDEX IF NOT EXISTS idx_probe_samples_account_created ON quality_probe_samples(account_id, created_at DESC, id DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_probe_samples_classification_created ON quality_probe_samples(classification, created_at DESC, id DESC)",
 }
 
 // InitializeSchema 以当前持久化模型作为首版数据库结构基线。

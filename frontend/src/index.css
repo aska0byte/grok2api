@@ -1,7 +1,7 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
-@custom-variant dark (&:is(.dark *));
+@custom-variant dark (&:is(.dark *, .tokyonight *));
 
 :root {
   --radius: 0.5rem;
@@ -72,6 +72,43 @@
   --quota-product-4: oklch(0.74 0.12 285);
   --quota-product-5: oklch(0.68 0.15 255);
   --quota-product-6: oklch(0.72 0.16 20);
+}
+
+/* Tokyo Night (dark) */
+.tokyonight {
+  --radius: 0.5rem;
+  --background: #1a1b26;
+  --foreground: #c0caf5;
+  --card: #1f2335;
+  --card-foreground: #c0caf5;
+  --popover: #1f2335;
+  --popover-foreground: #c0caf5;
+  --primary: #7aa2f7;
+  --primary-foreground: #1a1b26;
+  --secondary: #292e42;
+  --secondary-foreground: #c0caf5;
+  --muted: #292e42;
+  --muted-foreground: #787fa6;
+  --accent: #292e42;
+  --accent-foreground: #c0caf5;
+  --destructive: #f7768e;
+  --border: #2f334d;
+  --input: #343a55;
+  --ring: var(--border);
+  --sidebar: #16161e;
+  --sidebar-foreground: #c0caf5;
+  --sidebar-primary: #7aa2f7;
+  --sidebar-primary-foreground: #1a1b26;
+  --sidebar-accent: #292e42;
+  --sidebar-accent-foreground: #c0caf5;
+  --sidebar-border: #292e42;
+  --quota-product-0: #565f89;
+  --quota-product-1: #7aa2f7;
+  --quota-product-2: #9ece6a;
+  --quota-product-3: #e0af68;
+  --quota-product-4: #bb9af7;
+  --quota-product-5: #7dcfff;
+  --quota-product-6: #f7768e;
 }
 
 @theme inline {
@@ -148,6 +185,10 @@ html {
 }
 
 html.dark {
+  color-scheme: dark;
+}
+
+html.tokyonight {
   color-scheme: dark;
 }
 

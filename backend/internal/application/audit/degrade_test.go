@@ -263,7 +263,9 @@ func TestDegradeSummaryIncludesQualityDegradedThinkingRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Totals.Hits != 3 || summary.Totals.Accounts != 2 || summary.Totals.Hard != 1 || summary.Totals.Thinking != 2 {
+	// fail-closed 503 rejections now count as degrade evidence, matching the
+	// per-row tags shown on the request audit page.
+	if summary.Totals.Hits != 4 || summary.Totals.Accounts != 2 || summary.Totals.Hard != 1 || summary.Totals.Thinking != 3 {
 		t.Fatalf("totals = %#v", summary.Totals)
 	}
 	if len(summary.Accounts) != 2 {
@@ -273,7 +275,7 @@ func TestDegradeSummaryIncludesQualityDegradedThinkingRetries(t *testing.T) {
 	for _, account := range summary.Accounts {
 		byID[account.ID] = account
 	}
-	if byID[22].Hits != 2 || byID[22].Classes[auditdomain.DegradeClassThinking] != 2 {
+	if byID[22].Hits != 3 || byID[22].Classes[auditdomain.DegradeClassThinking] != 3 {
 		t.Fatalf("thinking account = %#v", byID[22])
 	}
 	thinkingOnly, err := service.DegradeSummary(ctx, "1h", DegradeThresholds{SoftTPS: 500, HardTPS: 1000}, DegradeAccountFilter{Class: auditdomain.DegradeClassThinking})

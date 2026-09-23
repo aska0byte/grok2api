@@ -190,11 +190,11 @@ func TestQualityGuardStateAcceptsBoundedMultiMegabyteState(t *testing.T) {
 	}
 }
 
-func TestWriteQualityProbeErrorUsesSpecificSafeMessage(t *testing.T) {
+func TestWriteQualityProbeErrorSurfacesUnknownMessage(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
 	NewHandler(nil).writeQualityProbeError(context, errors.New("sensitive upstream failure"))
-	if recorder.Code != 502 || !strings.Contains(recorder.Body.String(), `"code":"egressQualityProbeFailed"`) || !strings.Contains(recorder.Body.String(), "质量检测暂不可用") || strings.Contains(recorder.Body.String(), "sensitive upstream failure") {
+	if recorder.Code != 502 || !strings.Contains(recorder.Body.String(), `"code":"egressQualityProbeFailed"`) || !strings.Contains(recorder.Body.String(), "sensitive upstream failure") {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
@@ -205,6 +205,152 @@ func TestWriteQualityProbeErrorIdentifiesMissingProbeAccount(t *testing.T) {
 	NewHandler(nil).writeQualityProbeError(context, egressapp.ErrQualityProbeNoAccount)
 	if recorder.Code != 503 || !strings.Contains(recorder.Body.String(), `"code":"egressQualityProbeNoAccount"`) || !strings.Contains(recorder.Body.String(), "暂无可调度账号") {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+type accountControllerStub struct {
+	quarantineID   uint64
+	quarantineTime time.Duration
+	restoreID      uint64
+	quarantineErr  error
+	restoreErr     error
+}
+
+func (s *accountControllerStub) QuarantineAccount(_ context.Context, accountID uint64, cooldown time.Duration) error {
+	s.quarantineID = accountID
+	s.quarantineTime = cooldown
+	return s.quarantineErr
+}
+
+func (s *accountControllerStub) RestoreAccount(_ context.Context, accountID uint64) error {
+	s.restoreID = accountID
+	return s.restoreErr
+}
+
+func (s *accountControllerStub) QuarantineAccounts(_ context.Context, accountIDs []uint64, cooldown time.Duration) ([]uint64, []uint64, error) {
+	s.quarantineTime = cooldown
+	if s.quarantineErr != nil {
+		return nil, nil, s.quarantineErr
+	}
+	return accountIDs, nil, nil
+}
+
+func TestAccountQuarantineAndRestoreRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &egressapp.Service{}
+	stub := &accountControllerStub{}
+	service.SetAccountController(stub)
+	handler := NewHandler(service)
+	router := gin.New()
+	handler.Register(router.Group(""))
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest("POST", "/egress-operations/accounts/7/quarantine", bytes.NewBufferString(`{"hours":0}`)))
+	if recorder.Code != 400 || !strings.Contains(recorder.Body.String(), `"code":"invalidQuarantineHours"`) {
+		t.Fatalf("invalid hours status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest("POST", "/egress-operations/accounts/7/quarantine", bytes.NewBufferString(`{"hours":24}`)))
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"quarantined":true`) {
+		t.Fatalf("quarantine status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if stub.quarantineID != 7 || stub.quarantineTime != 24*time.Hour {
+		t.Fatalf("quarantine call = (%d, %s)", stub.quarantineID, stub.quarantineTime)
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest("POST", "/egress-operations/accounts/9/restore", nil))
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"restored":true`) {
+		t.Fatalf("restore status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if stub.restoreID != 9 {
+		t.Fatalf("restore call account = %d", stub.restoreID)
+	}
+
+	stub.restoreErr = repository.ErrNotFound
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest("POST", "/egress-operations/accounts/9/restore", nil))
+	if recorder.Code != 404 || !strings.Contains(recorder.Body.String(), `"code":"egressAccountNotFound"`) {
+		t.Fatalf("missing account status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	bare := NewHandler(&egressapp.Service{})
+	bareRouter := gin.New()
+	bare.Register(bareRouter.Group(""))
+	recorder = httptest.NewRecorder()
+	bareRouter.ServeHTTP(recorder, httptest.NewRequest("POST", "/egress-operations/accounts/9/restore", nil))
+	if recorder.Code != 503 || !strings.Contains(recorder.Body.String(), `"code":"egressAccountControlUnavailable"`) {
+		t.Fatalf("missing controller status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestAccountBatchQuarantineRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &egressapp.Service{}
+	stub := &accountControllerStub{}
+	service.SetAccountController(stub)
+	handler := NewHandler(service)
+	router := gin.New()
+	handler.Register(router.Group(""))
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest("POST", "/egress-operations/account-controls/quarantine", bytes.NewBufferString(`{"accountIds":[7,8],"hours":0}`)))
+	if recorder.Code != 400 || !strings.Contains(recorder.Body.String(), `"code":"invalidQuarantineHours"`) {
+		t.Fatalf("invalid hours status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest("POST", "/egress-operations/account-controls/quarantine", bytes.NewBufferString(`{"accountIds":[7,8],"hours":24}`)))
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"quarantined":[7,8]`) {
+		t.Fatalf("batch quarantine status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if stub.quarantineTime != 24*time.Hour {
+		t.Fatalf("batch quarantine cooldown = %s", stub.quarantineTime)
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest("POST", "/egress-operations/account-controls/quarantine", bytes.NewBufferString(`{"accountIds":[],"hours":24}`)))
+	if recorder.Code != 400 || !strings.Contains(recorder.Body.String(), `"code":"invalidRequest"`) {
+		t.Fatalf("empty ids status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestQualityGuardConfigPersistsEnabledFlag(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	directory := t.TempDir()
+	statePath := directory + "/state.json"
+	configPath := directory + "/runtime-config.json"
+	handler := NewHandler(nil, statePath, configPath)
+	router := gin.New()
+	handler.Register(router.Group(""))
+
+	if err := os.WriteFile(statePath, []byte(`{"version":1,"started_at":10,"updated_at":20,"guard":{"mode":"hybrid","model":"grok-4.5","node_ids":["8"]},"nodes":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest("PUT", "/egress-quality-guard/config", bytes.NewBufferString(`{"mode":"hybrid","activeIntervalSeconds":60,"passivePollSeconds":5,"softTPS":1000,"hardTPS":5000,"consecutiveSoft":2,"consecutiveErrors":2,"quarantineSeconds":300,"minHealthyNodes":1,"enabled":false}`)))
+	if recorder.Code != 200 {
+		t.Fatalf("config put status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"enabled":false`) {
+		t.Fatalf("runtime config missing disabled flag: %s", string(data))
+	}
+	if handler.qualityGuardRuntimeEnabled() {
+		t.Fatal("runtime enabled helper should report false after persisting enabled=false")
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest("PUT", "/egress-quality-guard/config", bytes.NewBufferString(`{"mode":"hybrid","activeIntervalSeconds":60,"passivePollSeconds":5,"softTPS":1000,"hardTPS":5000,"consecutiveSoft":2,"consecutiveErrors":2,"quarantineSeconds":300,"minHealthyNodes":1}`)))
+	if recorder.Code != 200 {
+		t.Fatalf("config put without enabled status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !handler.qualityGuardRuntimeEnabled() {
+		t.Fatal("omitting the enabled flag should default to enabled")
 	}
 }
 

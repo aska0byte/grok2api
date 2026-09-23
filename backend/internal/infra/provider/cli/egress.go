@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"time"
 
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
@@ -67,6 +68,8 @@ func (t *egressTransport) RoundTrip(request *http.Request) (*http.Response, erro
 	return response, nil
 }
 
+const qualityProbeStreamIdleTimeout = 10 * time.Minute
+
 // withStreamIdleContext returns a shallow copy of request carrying a
 // cancel-cause-aware context derived from the original. The cancel function is
 // stashed on the request context so wrapStreamIdleBody can arm an idle timer
@@ -78,6 +81,9 @@ func (t *egressTransport) withStreamIdleContext(request *http.Request) *http.Req
 		return request
 	}
 	idle := t.manager.BuildStreamIdleTimeout()
+	if infraegress.QualityProbeFromContext(request.Context()) {
+		idle = qualityProbeStreamIdleTimeout
+	}
 	if idle <= 0 {
 		return request
 	}
@@ -110,6 +116,13 @@ func (t *egressTransport) wrapStreamIdleBody(body io.ReadCloser, ctx context.Con
 		return body
 	}
 	return newIdleTimeoutReadCloser(body, idle, cancel)
+}
+
+func effectiveStreamIdleTimeout(base time.Duration, ctx context.Context) time.Duration {
+	if ctx != nil && infraegress.QualityProbeFromContext(ctx) {
+		return qualityProbeStreamIdleTimeout
+	}
+	return base
 }
 
 func shouldReportEgressFailure(ctx context.Context, err error) bool {

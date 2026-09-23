@@ -19,7 +19,6 @@ import (
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
-	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
 
@@ -75,10 +74,10 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 	if !ok {
 		return egressapp.QualityProbeResult{}, fmt.Errorf("%w: 质量探测模型必须属于 Grok Build", egressapp.ErrInvalidInput)
 	}
-	probeCtx := infraegress.WithQualityProbe(ctx)
-	result, err := s.CreateChatCompletion(probeCtx, Input{
+	result, err := s.CreateChatCompletion(ctx, Input{
 		RequestID: requestID, ClientKey: key, PublicModel: publicModel, Body: body,
 		Streaming: true, Operation: audit.OperationChat, ForcedEgressNodeID: nodeID,
+		QualityProbe: true,
 	})
 	if err != nil {
 		return egressapp.QualityProbeResult{}, normalizeQualityProbeRequestError(err)
@@ -97,6 +96,8 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 
 	var firstGeneratedAt time.Time
 	var visible strings.Builder
+	reasoningStart := false
+	reasoningDeltaSeen := false
 	chunkCount := 0
 	totalBytes := 0
 	terminal := false
@@ -111,6 +112,7 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 		}
 		line = []byte(strings.TrimSpace(string(line)))
 		if bytes.Equal(line, []byte(": grok2api-reasoning-start")) {
+			reasoningStart = true
 			if firstGeneratedAt.IsZero() {
 				firstGeneratedAt = time.Now()
 				if result.MarkFirstToken != nil {
@@ -144,6 +146,9 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 		}
 		for _, choice := range event.Choices {
 			delta := choice.Delta
+			if delta.Reasoning != "" || delta.ReasoningContent != "" || delta.ThinkingContent != "" {
+				reasoningDeltaSeen = true
+			}
 			generated := qualityProbeHasGeneratedDelta(delta.Content, delta.Reasoning, delta.ReasoningContent, delta.ThinkingContent)
 			if generated && firstGeneratedAt.IsZero() {
 				firstGeneratedAt = time.Now()
@@ -188,7 +193,12 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 	}
 	var outputTokensPerSecond float64
 	if !firstGeneratedAt.IsZero() {
-		outputTokensPerSecond = qualityProbeOutputTokensPerSecond(usage.OutputTokens, usage.ReasoningTokens, durationMS, firstTokenMS)
+		// Reasoning evidence beyond usage.reasoning_tokens: the Chat SSE stub
+		// or streamed reasoning deltas on streams whose usage never reports
+		// reasoning tokens (降智 shape) widen the TPS window to the full
+		// duration so a buffered flush is not crushed into the tail.
+		reasoningEvidence := reasoningStart || reasoningDeltaSeen || usage.ReasoningTokens > 0
+		outputTokensPerSecond = qualityProbeOutputTokensPerSecond(usage.OutputTokens, usage.ReasoningTokens, durationMS, firstTokenMS, reasoningEvidence)
 	}
 	digest := sha256.Sum256([]byte(text))
 	return egressapp.QualityProbeResult{
@@ -206,13 +216,39 @@ func qualityProbeBuildPublicModel(value string) (string, bool) {
 
 func normalizeQualityProbeRequestError(err error) error {
 	if errors.Is(err, ErrNoAvailableAccount) {
-		return egressapp.ErrQualityProbeNoAccount
+		return fmt.Errorf("%w%s", egressapp.ErrQualityProbeNoAccount, qualityProbeSelectionDetail(err))
 	}
 	return err
 }
 
-func qualityProbeOutputTokensPerSecond(outputTokens, reasoningTokens, durationMS, firstTokenMS int64) float64 {
-	return audit.OutputTokensPerSecond(outputTokens, reasoningTokens, firstTokenMS, durationMS)
+// qualityProbeSelectionDetail appends the concrete scheduling blocker (quota
+// exhausted, model cooling, ...) so pinned-account probes fail with an
+// actionable message instead of the generic no-account text.
+func qualityProbeSelectionDetail(err error) string {
+	var selection *SelectionUnavailableError
+	if !errors.As(err, &selection) || selection == nil {
+		return ""
+	}
+	// 钉定探测的精确拒绝原因（范围/认证/模型路由）优先。
+	if selection.Detail != "" {
+		return "：" + selection.Detail
+	}
+	switch selection.Reason {
+	case SelectionQuotaExhausted:
+		return "：账号额度耗尽或处于额度恢复，无法发起探测"
+	case SelectionModelCooling:
+		return "：账号模型级冷却中，无法发起探测"
+	case SelectionCooling:
+		return "：账号冷却中，无法发起探测"
+	case SelectionUnsupportedModel:
+		return "：探测模型无可用路由，无法发起探测"
+	default:
+		return "：账号当前不可调度（可能已禁用或已删除）"
+	}
+}
+
+func qualityProbeOutputTokensPerSecond(outputTokens, reasoningTokens, durationMS, firstTokenMS int64, reasoningObserved bool) float64 {
+	return audit.OutputTokensPerSecondObserved(outputTokens, reasoningTokens, firstTokenMS, durationMS, reasoningObserved)
 }
 
 func qualityProbeHasGeneratedDelta(content, reasoning, reasoningContent, thinkingContent string) bool {

@@ -661,6 +661,11 @@ func TestShouldHoldQualityStreamGates(t *testing.T) {
 	if shouldHoldQualityStream(forced, nil, route, audit.OperationChat, cfg) {
 		t.Fatal("forced egress must not hold")
 	}
+	probe := input
+	probe.QualityProbe = true
+	if shouldHoldQualityStream(probe, nil, route, audit.OperationChat, cfg) {
+		t.Fatal("quality probe traffic must not hold")
+	}
 	owned := inferencedomain.ResponseOwnership{ResponseID: "r1", AccountID: 1}
 	if shouldHoldQualityStream(input, &owned, route, audit.OperationChat, cfg) {
 		t.Fatal("pinned response must not hold")

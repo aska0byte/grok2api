@@ -64,6 +64,9 @@ func (r *EgressRepository) ListEgressNodePage(ctx context.Context, input reposit
 	if input.Filter.ProbeStatus != "" {
 		query = query.Where("egress_nodes.probe_status = ?", input.Filter.ProbeStatus)
 	}
+	if input.Filter.Usage != "" {
+		query = query.Where("egress_nodes.usage = ?", string(input.Filter.Usage))
+	}
 	switch input.Filter.Assignment {
 	case "bound":
 		query = query.Where("EXISTS (SELECT 1 FROM provider_accounts account WHERE account.egress_node_id = egress_nodes.id)")
@@ -148,6 +151,28 @@ func (r *EgressRepository) CreateEgressNodes(ctx context.Context, values []egres
 		return 0, mapError(err)
 	}
 	return len(rows), nil
+}
+
+func (r *EgressRepository) CountEgressNodesByUsage(ctx context.Context, usage egress.Usage) (int64, error) {
+	var count int64
+	if err := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).Where("usage = ?", string(usage)).Count(&count).Error; err != nil {
+		return 0, mapError(err)
+	}
+	return count, nil
+}
+
+func (r *EgressRepository) DeleteOldestEgressNodesByUsage(ctx context.Context, usage egress.Usage, limit int64) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	result := r.db.db.WithContext(ctx).Where(
+		"id IN (?)",
+		r.db.db.WithContext(ctx).Model(&egressNodeModel{}).Select("id").Where("usage = ?", string(usage)).Order("id ASC").Limit(int(limit)),
+	).Delete(&egressNodeModel{})
+	if result.Error != nil {
+		return 0, mapError(result.Error)
+	}
+	return result.RowsAffected, nil
 }
 
 func (r *EgressRepository) UpdateEgressNode(ctx context.Context, value egress.Node) (egress.Node, error) {
@@ -836,7 +861,8 @@ func (r *EgressRepository) assignedAccountCountsForNodes(ctx context.Context, no
 func toEgressDomain(row egressNodeModel) egress.Node {
 	return egress.Node{
 		ID: row.ID, Name: row.Name, Scope: egress.Scope(row.Scope), Enabled: row.Enabled, ProxyPool: row.ProxyPool,
-		SourceID: valueEgressNodeID(row.SourceID), SourceKey: row.SourceKey, AccountCapacity: row.AccountCapacity,
+		Usage:      egress.Usage(row.Usage).Normalize(),
+		SourceID:   valueEgressNodeID(row.SourceID), SourceKey: row.SourceKey, AccountCapacity: row.AccountCapacity,
 		ProxyProfileID:    valueEgressNodeID(row.ProxyProfileID),
 		EncryptedProxyURL: row.EncryptedProxyURL, UserAgent: row.UserAgent, EncryptedCloudflareCookie: row.EncryptedCloudflareCookie,
 		ClearanceRefreshedAt: row.ClearanceRefreshedAt, ClearanceFingerprint: row.ClearanceFingerprint,
@@ -861,7 +887,8 @@ func fromEgressDomain(value egress.Node) egressNodeModel {
 	}
 	return egressNodeModel{
 		ID: value.ID, Name: value.Name, Scope: string(value.Scope), Enabled: value.Enabled, ProxyPool: value.ProxyPool,
-		SourceID: egressNodeID(value.SourceID), SourceKey: value.SourceKey, AccountCapacity: value.AccountCapacity,
+		Usage:      string(value.Usage.Normalize()),
+		SourceID:   egressNodeID(value.SourceID), SourceKey: value.SourceKey, AccountCapacity: value.AccountCapacity,
 		ProxyProfileID:    egressNodeID(value.ProxyProfileID),
 		EncryptedProxyURL: value.EncryptedProxyURL, UserAgent: value.UserAgent, EncryptedCloudflareCookie: value.EncryptedCloudflareCookie,
 		ClearanceRefreshedAt: value.ClearanceRefreshedAt, ClearanceFingerprint: value.ClearanceFingerprint,
@@ -930,6 +957,7 @@ func toEgressOperationsConfigDomain(row egressOperationsConfigModel) egress.Oper
 		ProbeProvider:        egress.ProbeProvider(row.ProbeProvider).Normalized(),
 		ProbeIntervalSeconds: row.ProbeIntervalSeconds, AutoAssignEnabled: row.AutoAssignEnabled, AutoBalanceEnabled: row.AutoBalanceEnabled,
 		AssignmentIntervalSeconds: row.AssignmentIntervalSeconds,
+		ProbeNodeLimit:            row.ProbeNodeLimit,
 		Fallbacks: map[egress.Scope]egress.FallbackConfig{
 			egress.ScopeBuild:        {Mode: egress.FallbackMode(row.BuildFallbackMode).Normalized(), NodeID: row.BuildFallbackNodeID},
 			egress.ScopeWeb:          {Mode: egress.FallbackMode(row.WebFallbackMode).Normalized(), NodeID: row.WebFallbackNodeID},
@@ -950,6 +978,7 @@ func fromEgressOperationsConfigDomain(value egress.OperationsConfig) egressOpera
 	return egressOperationsConfigModel{
 		ID: 1, ProbeProvider: string(value.ProbeProvider.Normalized()), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
+		ProbeNodeLimit: value.ProbeNodeLimit,
 		BuildFallbackMode: string(buildFallback.Mode), BuildFallbackNodeID: buildFallback.NodeID,
 		WebFallbackMode: string(webFallback.Mode), WebFallbackNodeID: webFallback.NodeID,
 		ConsoleFallbackMode: string(consoleFallback.Mode), ConsoleFallbackNodeID: consoleFallback.NodeID,

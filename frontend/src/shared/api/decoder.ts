@@ -6,8 +6,10 @@ export const isNumber: ValueValidator = (value) => typeof value === "number" && 
 export const isBoolean: ValueValidator = (value) => typeof value === "boolean";
 export const isObject: ValueValidator = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 
+// JSON.parse 从不产生 undefined；后端可空字段序列化为 null（如探测响应的
+// confirmation），可选项必须同时放行 undefined 与 null，否则解码误报失败。
 export function isOptional(validator: ValueValidator): ValueValidator {
-  return (value) => value === undefined || validator(value);
+  return (value) => value === undefined || value === null || validator(value);
 }
 
 export function isArrayOf(validator: ValueValidator): ValueValidator {

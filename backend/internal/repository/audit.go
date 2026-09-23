@@ -17,6 +17,22 @@ type AuditRepository interface {
 	Summarize(ctx context.Context, query AuditSummaryQuery) (audit.Summary, error)
 	SumTokensByAccountsSince(ctx context.Context, accountIDs []uint64, since time.Time) (map[uint64]int64, error)
 	SummarizeDegrade(ctx context.Context, query DegradeSummaryQuery) (DegradeSummaryResult, error)
+	// SummarizeCrossProxySuspects aggregates real (non-probe) failed requests
+	// per account over the window and returns accounts whose failures span at
+	// least `threshold` distinct egress nodes — the cross-proxy evidence used
+	// to schedule account quality probes.
+	SummarizeCrossProxySuspects(ctx context.Context, start time.Time, threshold, limit int) ([]CrossProxySuspect, error)
+}
+
+// CrossProxySuspect is one account seen failing across multiple egress nodes.
+// NodeID carries the account's current long-lived egress binding (0 when
+// unbound) so the probe scheduler can honor the bound-node-only rule.
+type CrossProxySuspect struct {
+	AccountID uint64
+	NodeID    uint64
+	Nodes     int64
+	Hits      int64
+	Last      time.Time
 }
 
 type DegradeSummaryQuery struct {

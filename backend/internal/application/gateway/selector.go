@@ -166,6 +166,8 @@ type SelectionUnavailableError struct {
 	Reason     SelectionUnavailableReason
 	RetryAfter time.Duration
 	Scope      clientkeydomain.AccountScope
+	// Detail 精确描述钉定账号被拒的具体原因（仅钉定探测路径填充）。
+	Detail string
 }
 
 func (e *SelectionUnavailableError) Error() string {
@@ -420,11 +422,11 @@ func (s *Selector) applyBuildBotFlaggedFilter(_ context.Context, provider accoun
 }
 
 func (s *Selector) Acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*accountLease, error) {
-	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, clientkeydomain.AccountScope{}, 0)
+	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, clientkeydomain.AccountScope{}, 0, 0)
 }
 
 func (s *Selector) AcquireForKey(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, scope clientkeydomain.AccountScope) (*accountLease, error) {
-	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, scope, 0)
+	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, scope, 0, 0)
 }
 
 // AcquireForKeyOnEgressNode is reserved for administrator probes. It prefers a
@@ -435,7 +437,7 @@ func (s *Selector) AcquireForKeyOnEgressNode(ctx context.Context, provider accou
 	if nodeID == 0 {
 		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: scope}
 	}
-	lease, err := s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, scope, nodeID)
+	lease, err := s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, scope, nodeID, 0)
 	if err == nil {
 		return lease, nil
 	}
@@ -444,10 +446,21 @@ func (s *Selector) AcquireForKeyOnEgressNode(ctx context.Context, provider accou
 		return nil, err
 	}
 	// Probe borrowing must not create or reuse ordinary sticky affinity.
-	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, "", excluded, allowQuotaProbe, scope, 0)
+	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, "", excluded, allowQuotaProbe, scope, 0, 0)
 }
 
-func (s *Selector) acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, requestedScope clientkeydomain.AccountScope, forcedEgressNodeID uint64) (lease *accountLease, err error) {
+// AcquireForKeyOnAccount pins selection to one account for administrator
+// quality probes. It never borrows another credential and ignores the account
+// cooldown so cooled accounts can be re-verified; the physical call still
+// prefers nodeID when set.
+func (s *Selector) AcquireForKeyOnAccount(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, scope clientkeydomain.AccountScope, accountID, nodeID uint64) (*accountLease, error) {
+	if accountID == 0 {
+		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: scope}
+	}
+	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, "", excluded, allowQuotaProbe, scope, nodeID, accountID)
+}
+
+func (s *Selector) acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, requestedScope clientkeydomain.AccountScope, forcedEgressNodeID, forcedAccountID uint64) (lease *accountLease, err error) {
 	accountScope, scopeValid := clientkeydomain.NormalizeAccountScope(requestedScope)
 	defer annotateSelectionAccountScope(&err, accountScope)
 	if !scopeValid || !accountScope.AllowsProvider(provider) {
@@ -458,6 +471,31 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	values, err := s.loadCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode, now)
 	if err != nil {
 		return nil, err
+	}
+	// 钉定探测（pinned）是运维操作：绕过冷却、模型级冷却与额度门槛，让运营者
+	// 能复核冷却中/额度受限/已禁用/风控标记的账号；只保留范围等硬性过滤。
+	pinned := forcedAccountID != 0
+	if pinned {
+		// 普通候选加载在 SQL 层就排除了禁用与认证异常账号；钉定探测看不到就
+		// 永远无法复核，这里按 ID 直读补载（账号已删除时保持原报错）。
+		found := false
+		for _, candidate := range values {
+			if candidate.Credential.ID == forcedAccountID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if probeRepo, ok := s.accounts.(repository.ProbeCandidateRepository); ok {
+				candidate, exists, loadErr := probeRepo.ListRoutingCandidateForProbe(ctx, provider, forcedAccountID)
+				if loadErr != nil {
+					return nil, loadErr
+				}
+				if exists {
+					values = append(values, candidate)
+				}
+			}
+		}
 	}
 	quotaConsumed := s.quotaConsumptionSnapshot(provider)
 	healthOverrides := s.routingHealthSnapshot(provider, now)
@@ -470,34 +508,41 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	modelCoolingCandidates := 0
 	quotaCandidates := 0
 	var earliestRetry time.Time
+	forcedDropped := ""
 	for index, candidate := range values {
 		value := applyHealthSnapshot(candidate.Credential, healthOverrides)
+		if forcedAccountID != 0 && value.ID != forcedAccountID {
+			continue
+		}
 		if forcedEgressNodeID != 0 && value.EgressNodeID != forcedEgressNodeID {
 			continue
 		}
 		if !accountScopeAllowsCandidate(provider, accountScope, candidate) {
+			if pinned {
+				forcedDropped = "Client Key 账号范围不包含该账号"
+			}
 			continue
 		}
-		if excluded[value.ID] || value.AuthStatus != account.AuthStatusActive {
+		if excluded[value.ID] || (!pinned && value.AuthStatus != account.AuthStatusActive) {
 			continue
 		}
 		consideredCandidates++
-		if !s.candidateSupportsModel(provider, upstreamModel, quotaMode, candidate) {
+		if !pinned && !s.candidateSupportsModel(provider, upstreamModel, quotaMode, candidate) {
 			continue
 		}
 		supportedCandidates++
-		if candidate.ModelQuotaBlock != nil && now.Before(candidate.ModelQuotaBlock.CooldownUntil) {
+		if !pinned && candidate.ModelQuotaBlock != nil && now.Before(candidate.ModelQuotaBlock.CooldownUntil) {
 			modelCoolingCandidates++
 			earliestRetry = earlierFuture(earliestRetry, candidate.ModelQuotaBlock.CooldownUntil, now)
 			continue
 		}
-		if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
+		if forcedAccountID == 0 && value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
 			coolingCandidates++
 			earliestRetry = earlierFuture(earliestRetry, *value.CooldownUntil, now)
 			continue
 		}
 		quotaRecovery := candidate.QuotaRecovery
-		if quotaRecovery != nil && quotaRecovery.Status != account.QuotaRecoveryStatusActive {
+		if !pinned && quotaRecovery != nil && quotaRecovery.Status != account.QuotaRecoveryStatusActive {
 			if allowQuotaProbe && quotaRecovery.NextProbeAt != nil && !now.Before(*quotaRecovery.NextProbeAt) {
 				probeCandidates = append(probeCandidates, index)
 			} else {
@@ -508,11 +553,11 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			}
 			continue
 		}
-		if candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
+		if !pinned && candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
 			quotaCandidates++
 			continue
 		}
-		if quotaWindowExhausted(candidate, quotaConsumed) {
+		if !pinned && quotaWindowExhausted(candidate, quotaConsumed) {
 			quotaCandidates++
 			if candidate.QuotaWindow.ResetAt != nil {
 				earliestRetry = earlierFuture(earliestRetry, *candidate.QuotaWindow.ResetAt, now)
@@ -533,7 +578,31 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 		case quotaCandidates > 0:
 			reason = SelectionQuotaExhausted
 		}
+		if pinned && forcedDropped != "" {
+			return nil, &SelectionUnavailableError{Reason: reason, Detail: forcedDropped, RetryAfter: retryDelay(now, earliestRetry)}
+		}
 		return nil, &SelectionUnavailableError{Reason: reason, RetryAfter: retryDelay(now, earliestRetry)}
+	}
+	if pinned {
+		// 钉定探测：绕过粘滞/分段/额度探测候选逻辑，直接认领目标账号；
+		// 失败时给出精确原因，不退化为误导性的饱和 503。
+		if len(normalCandidates) == 0 {
+			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Detail: forcedDropped, RetryAfter: retryDelay(now, earliestRetry)}
+		}
+		candidate := values[normalCandidates[0]]
+		lease, claimErr := s.claimAccountSlotWithOptions(ctx, candidate.Credential, true)
+		if claimErr != nil {
+			if errors.Is(claimErr, errRoutingCredentialStale) {
+				return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Detail: "账号执行凭据缺失或已变更，无法探测"}
+			}
+			return nil, claimErr
+		}
+		if lease == nil {
+			return nil, &SelectionUnavailableError{Reason: SelectionSaturated, RetryAfter: time.Second}
+		}
+		lease.Billing = candidate.Billing
+		lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
+		return lease, nil
 	}
 	if len(probeCandidates) > 0 {
 		staleClaims := 0
@@ -1139,6 +1208,11 @@ func (s *Selector) markMissingThinking(ctx context.Context, credential account.C
 			return missingThinkingPenaltyUnchanged, err
 		}
 		healthErr := s.accounts.UpdateHealth(ctx, credential.ID, credential.Provider, credential.FailureCount, nil, lastErrorMissingThinkingDisabled, false)
+		// The account is permanently degraded; release its long-lived proxy so
+		// the capacity slot returns to the pool immediately.
+		if _, bindErr := s.accounts.UpdateEgressBindings(ctx, credential.Provider, []uint64{credential.ID}, nil, "", time.Time{}); bindErr != nil {
+			s.logger.Warn("missing_thinking_unbind_failed", "account_id", credential.ID, "error", bindErr)
+		}
 		s.ApplyInvalidation(repository.InvalidationEvent{
 			Kind: repository.InvalidationAccountStateChanged, Provider: credential.Provider, AccountID: credential.ID,
 		})
@@ -1161,6 +1235,96 @@ func (s *Selector) markMissingThinking(ctx context.Context, credential account.C
 	})
 	s.evictCandidate(credential.Provider, credential.ID)
 	return missingThinkingPenaltyCooled, nil
+}
+
+// MarkAccountMissingThinking applies the shipped missing-thinking strike to one
+// account for administrator quality probes: the first hit cools the account
+// down, a second hit after that cooldown disables it.
+func (s *Selector) MarkAccountMissingThinking(ctx context.Context, provider account.Provider, accountID uint64, cooldown time.Duration) (missingThinkingPenaltyResult, error) {
+	credential, err := s.accounts.Get(ctx, accountID)
+	if err != nil {
+		return missingThinkingPenaltyUnchanged, err
+	}
+	if credential.Provider != provider {
+		return missingThinkingPenaltyUnchanged, repository.ErrNotFound
+	}
+	return s.markMissingThinking(ctx, credential, cooldown)
+}
+
+// ClearAccountMissingThinking removes the missing-thinking strike and cooldown
+// after a probe observed healthy reasoning evidence.
+func (s *Selector) ClearAccountMissingThinking(ctx context.Context, provider account.Provider, accountID uint64) error {
+	credential, err := s.accounts.Get(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if credential.Provider != provider || !isMissingThinkingStrike(credential.LastError) {
+		return nil
+	}
+	if err := s.accounts.UpdateHealth(ctx, credential.ID, credential.Provider, credential.FailureCount, nil, "", true); err != nil {
+		return err
+	}
+	s.ApplyInvalidation(repository.InvalidationEvent{
+		Kind: repository.InvalidationAccountHealthChanged, Provider: credential.Provider, AccountID: credential.ID,
+		FailureCount: credential.FailureCount,
+	})
+	s.evictCandidate(credential.Provider, credential.ID)
+	return nil
+}
+
+// MarkAccountCooling applies an operator-ordered cooldown to one account.
+// Failure counts and any missing-thinking strike marker are preserved: when
+// the cooldown expires the account returns to rotation with its prior history
+// intact, unlike the strike machine which escalates to disable.
+func (s *Selector) MarkAccountCooling(ctx context.Context, provider account.Provider, accountID uint64, cooldown time.Duration) error {
+	credential, err := s.accounts.Get(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if credential.Provider != provider {
+		return repository.ErrNotFound
+	}
+	until := time.Now().UTC().Add(cooldown)
+	if credential.CooldownUntil != nil && credential.CooldownUntil.After(until) {
+		until = *credential.CooldownUntil
+	}
+	if err := s.accounts.UpdateHealth(ctx, credential.ID, credential.Provider, credential.FailureCount, &until, credential.LastError, false); err != nil {
+		return err
+	}
+	s.ApplyInvalidation(repository.InvalidationEvent{
+		Kind: repository.InvalidationAccountHealthChanged, Provider: credential.Provider, AccountID: credential.ID,
+		FailureCount: credential.FailureCount, CooldownUntil: &until,
+	})
+	s.evictCandidate(credential.Provider, credential.ID)
+	return nil
+}
+
+// RestoreAccount re-enables one account and resets its request-path health:
+// cooldown, missing-thinking strike marker, and failure backoff. It is the
+// counterpart to operator quarantine/disable actions from the quality-guard
+// panels.
+func (s *Selector) RestoreAccount(ctx context.Context, provider account.Provider, accountID uint64) error {
+	credential, err := s.accounts.Get(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if credential.Provider != provider {
+		return repository.ErrNotFound
+	}
+	if !credential.Enabled {
+		enabled := true
+		if _, err := s.accounts.UpdateMany(ctx, credential.Provider, []uint64{credential.ID}, repository.AccountUpdates{Enabled: &enabled}); err != nil {
+			return err
+		}
+	}
+	if err := s.accounts.UpdateHealth(ctx, credential.ID, credential.Provider, 0, nil, "", false); err != nil {
+		return err
+	}
+	s.ApplyInvalidation(repository.InvalidationEvent{
+		Kind: repository.InvalidationAccountStateChanged, Provider: credential.Provider, AccountID: credential.ID,
+	})
+	s.evictCandidate(credential.Provider, credential.ID)
+	return nil
 }
 
 func (s *Selector) MarkFailure(ctx context.Context, credential account.Credential, status int, retryAfter time.Duration) {
@@ -1939,14 +2103,26 @@ func (s *Selector) evictCandidate(provider account.Provider, accountID uint64) {
 }
 
 func (s *Selector) claimAccountSlot(ctx context.Context, value account.Credential) (*accountLease, error) {
+	return s.claimAccountSlotWithOptions(ctx, value, false)
+}
+
+// claimAccountSlotWithOptions claims one concurrency slot for an account.
+// probe=true is the pinned quality-probe path: the operator explicitly asked
+// to test this account, so the cooldown re-check is skipped and the slot
+// limit is overbooked by one — evidence gathering never stalls behind
+// saturated normal traffic.
+func (s *Selector) claimAccountSlotWithOptions(ctx context.Context, value account.Credential, probe bool) (*accountLease, error) {
 	now := time.Now().UTC()
 	value = s.applyRoutingHealth(value, now)
-	if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
+	if !probe && value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
 		return nil, nil
 	}
 	limit := value.MaxConcurrent
 	if limit <= 0 {
 		limit = account.DefaultMaxConcurrent
+	}
+	if probe {
+		limit++
 	}
 	release, acquired, err := s.concurrency.Acquire(ctx, accountConcurrencyKey(value.ID), limit)
 	if err != nil {
@@ -1961,6 +2137,11 @@ func (s *Selector) claimAccountSlot(ctx context.Context, value account.Credentia
 	}
 	if s.accounts != nil {
 		material, loadErr := s.accounts.GetCredentialMaterial(ctx, value.ID, value.Provider)
+		if loadErr != nil && errors.Is(loadErr, repository.ErrNotFound) && probe {
+			// 钉定探测允许禁用/非活跃账号；主凭据查询过滤了 enabled/auth，
+			// 回退到不过滤的探测版加载，仍缺失才判定凭据失效。
+			material, loadErr = s.accounts.GetCredentialMaterialForProbe(ctx, value.ID, value.Provider)
+		}
 		if loadErr != nil {
 			releaseSlot()
 			if errors.Is(loadErr, repository.ErrNotFound) {

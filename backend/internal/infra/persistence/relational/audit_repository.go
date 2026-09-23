@@ -569,6 +569,52 @@ func (r *AuditRepository) SumTokensByAccountsSince(ctx context.Context, accountI
 	return result, nil
 }
 
+// SummarizeCrossProxySuspects 聚合时间窗内跨多个出口节点真实失败（非探测流量）的账号。
+// 仅统计 Build 路由的失败请求：request_id 排除 quality_ 前缀的主动探测，error_code
+// 限定 upstream 类错误（连接层失败），跨节点数达到 threshold 才视为可疑。
+func (r *AuditRepository) SummarizeCrossProxySuspects(ctx context.Context, start time.Time, threshold, limit int) ([]repository.CrossProxySuspect, error) {
+	result := make([]repository.CrossProxySuspect, 0, limit)
+	if threshold <= 0 || limit <= 0 {
+		return result, nil
+	}
+	var rows []struct {
+		AccountID uint64     `gorm:"column:account_id"`
+		NodeID    *uint64    `gorm:"column:node_id"`
+		Nodes     int64      `gorm:"column:nodes"`
+		Hits      int64      `gorm:"column:hits"`
+		Last      *time.Time `gorm:"column:last"`
+	}
+	err := r.db.db.WithContext(ctx).
+		Model(&requestAuditModel{}).
+		Select("audit.account_id AS account_id, binding.egress_node_id AS node_id, COUNT(DISTINCT audit.egress_node_id) AS nodes, COUNT(*) AS hits, MAX(audit.created_at) AS last").
+		Joins("AS audit JOIN provider_accounts AS binding ON binding.id = audit.account_id").
+		Where("audit.provider = ? AND audit.request_id NOT LIKE ? AND audit.account_id IS NOT NULL AND audit.egress_node_id IS NOT NULL AND audit.status_code >= 400 AND audit.error_code LIKE ? AND audit.created_at >= ?",
+			"grok_build", "quality\\_%", "upstream%", start).
+		Group("audit.account_id, binding.egress_node_id").
+		Having("COUNT(DISTINCT audit.egress_node_id) >= ?", threshold).
+		Order("nodes DESC, hits DESC").
+		Limit(limit).
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		suspect := repository.CrossProxySuspect{
+			AccountID: row.AccountID,
+			Nodes:     row.Nodes,
+			Hits:      row.Hits,
+		}
+		if row.NodeID != nil {
+			suspect.NodeID = *row.NodeID
+		}
+		if row.Last != nil {
+			suspect.Last = *row.Last
+		}
+		result = append(result, suspect)
+	}
+	return result, nil
+}
+
 func (r *AuditRepository) List(ctx context.Context, offset, limit int) ([]audit.Record, int64, error) {
 	var total int64
 	query := r.db.db.WithContext(ctx).Model(&requestAuditModel{})
@@ -929,7 +975,10 @@ func (r *AuditRepository) degradeClassifiedQuery(tx *gorm.DB, input repository.D
 		"a.streaming = ? AND %s AND a.output_tokens >= ? AND a.first_token_ms IS NOT NULL AND a.duration_ms > a.first_token_ms AND %s >= ?",
 		auditSuccessPredicate, tpsExpression,
 	)
-	thinkingPredicate := "a.streaming = ? AND a.error_code = ? AND a.status_code >= 200 AND a.status_code < 300"
+	// The audit page tags every quality_degraded row (fail-closed 503s and
+	// non-streaming marks included); the degrade panel must aggregate the same
+	// evidence or judged accounts vanish from the operator view.
+	thinkingPredicate := "a.error_code = ?"
 	query := tx.Table("request_audits AS a").
 		Select("a.id, a.request_id, a.account_id, a.account_name, a.egress_node_id, a.egress_node_name, a.output_tokens, a.created_at, a.model_upstream_model, "+selectTPS+" AS tps, "+classExpression+" AS degrade_class",
 			audit.ErrorQualityDegraded,
@@ -938,7 +987,7 @@ func (r *AuditRepository) degradeClassifiedQuery(tx *gorm.DB, input repository.D
 		Where("a.request_id NOT LIKE ?", "quality_%").
 		Where("(("+speedPredicate+") OR ("+thinkingPredicate+"))",
 			true, input.MinOutputTokens, input.SoftTPS,
-			true, audit.ErrorQualityDegraded)
+			audit.ErrorQualityDegraded)
 	if !input.Start.IsZero() {
 		query = query.Where("a.created_at >= ?", input.Start)
 	}

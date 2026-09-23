@@ -42,6 +42,10 @@ func (p *qualityProberStub) ProbeEgressQuality(_ context.Context, nodeID uint64,
 	return QualityProbeResult{NodeID: nodeID, ExpectedMatched: true}, nil
 }
 
+func (p *qualityProberStub) ProbeAccountQuality(_ context.Context, accountID, nodeID uint64, _ QualityProbeInput, _ string) (AccountQualityProbeResult, error) {
+	return AccountQualityProbeResult{AccountID: accountID, NodeID: nodeID, ThinkingObserved: true}, nil
+}
+
 func TestProbeQualityNormalizesDefaultsAndAllowsDisabledNode(t *testing.T) {
 	repository := &qualityProbeRepository{node: domain.Node{
 		ID: 7, Scope: domain.ScopeBuild, Enabled: false, EncryptedProxyURL: "encrypted",

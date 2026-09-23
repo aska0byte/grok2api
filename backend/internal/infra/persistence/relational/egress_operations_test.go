@@ -398,7 +398,7 @@ func TestEgressOperationsListsSourcePagesByScopeAndSearch(t *testing.T) {
 	}
 }
 
-func TestEgressOperationsAutoAssignSkipsCoolingFixedNode(t *testing.T) {
+func TestEgressOperationsAutoAssignIncludesCoolingFixedNode(t *testing.T) {
 	ctx := context.Background()
 	database := openTestDatabase(t)
 	accounts := NewAccountRepository(database)
@@ -425,8 +425,10 @@ func TestEgressOperationsAutoAssignSkipsCoolingFixedNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.EgressNodeID != available.ID {
-		t.Fatalf("assigned node = %d, want %d (cooling node %d)", stored.EgressNodeID, available.ID, cooling.ID)
+	// Cooling nodes stay eligible for automatic assignment; only disabled or
+	// structurally unusable nodes are skipped. Ties resolve to the lowest ID.
+	if stored.EgressNodeID != cooling.ID {
+		t.Fatalf("assigned node = %d, want %d (available node %d)", stored.EgressNodeID, cooling.ID, available.ID)
 	}
 }
 

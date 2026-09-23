@@ -18,6 +18,7 @@ import (
 	mediaapp "github.com/chenyme/grok2api/backend/internal/application/media"
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
 	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
+	qualityguardapp "github.com/chenyme/grok2api/backend/internal/application/qualityguard"
 	updatecheckapp "github.com/chenyme/grok2api/backend/internal/application/updatecheck"
 	accounthttp "github.com/chenyme/grok2api/backend/internal/transport/http/account"
 	adminauthhttp "github.com/chenyme/grok2api/backend/internal/transport/http/adminauth"
@@ -29,6 +30,7 @@ import (
 	mediahttp "github.com/chenyme/grok2api/backend/internal/transport/http/media"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
 	modelhttp "github.com/chenyme/grok2api/backend/internal/transport/http/model"
+	qualityguardhttp "github.com/chenyme/grok2api/backend/internal/transport/http/qualityguard"
 	settingshttp "github.com/chenyme/grok2api/backend/internal/transport/http/settings"
 	systemhttp "github.com/chenyme/grok2api/backend/internal/transport/http/system"
 	"github.com/gin-gonic/gin"
@@ -61,6 +63,7 @@ type Dependencies struct {
 	Media                  *mediaapp.Service
 	Settings               *settingsapp.Service
 	Egress                 *egressapp.Service
+	ProbeSamples           *qualityguardapp.Service
 	QualityGuardStatePath  string
 	QualityGuardConfigPath string
 	QualityGuardToken      string
@@ -159,6 +162,12 @@ func New(deps Dependencies) *gin.Engine {
 	settingshttp.NewHandler(deps.Settings).Register(adminProtected)
 	egressHandler := egresshttp.NewHandler(deps.Egress, deps.QualityGuardStatePath, deps.QualityGuardConfigPath).WithQualityGuardProbe(deps.QualityGuardProbe)
 	egressHandler.Register(adminProtected)
+	if deps.Gateway != nil {
+		deps.Gateway.SetQualityGuardRuntimeSwitch(deps.QualityGuardConfigPath)
+	}
+	if deps.ProbeSamples != nil {
+		qualityguardhttp.NewHandler(deps.ProbeSamples).Register(adminProtected)
+	}
 	systemhttp.NewHandler(func() string {
 		if deps.Settings != nil {
 			return deps.Settings.PublicAPIBaseURL()

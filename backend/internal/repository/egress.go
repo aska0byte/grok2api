@@ -48,6 +48,7 @@ type EgressNodeListFilter struct {
 	Enabled     *bool
 	ProbeStatus egress.ProbeStatus
 	Assignment  string
+	Usage       egress.Usage
 }
 
 type EgressNodeListQuery struct {

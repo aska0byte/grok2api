@@ -116,6 +116,14 @@ type Input struct {
 	// ForcedEgressNodeID is an internal-only administrator probe constraint.
 	// Public inference handlers never populate it.
 	ForcedEgressNodeID uint64
+	// ForcedAccountID pins selection to one account for account quality
+	// probes. It never borrows another credential and ignores cooldown.
+	ForcedAccountID uint64
+	// QualityProbe marks internal quality/account probe traffic. Probe calls
+	// stay auditable, but every passive quality-guard interception treats
+	// them as exempt — the stream hold never withholds them, and the guard's
+	// own scans ignore their audit rows.
+	QualityProbe bool
 }
 
 type Usage struct {
@@ -215,6 +223,15 @@ type Service struct {
 	modelSyncing                map[uint64]struct{}
 	markBuildChatDeniedAsReauth atomic.Bool
 	qualityRetry                atomic.Pointer[QualityRetryRuntime]
+	qualityGuardSwitch          atomic.Pointer[qualityGuardRuntimeSwitch]
+	accountProbeConfig          atomic.Pointer[AccountProbeRuntime]
+	accountProbeLastScan        atomic.Int64
+	accountProbeStrikes         accountProbeStrikeSource
+	accountProbeAudits          accountProbeAuditSource
+	accountProbeNodes           accountProbeNodeSource
+	accountProbeBound           accountProbeBoundSource
+	accountProbeSamples         accountProbeSampleSink
+	accountProbeCursor          atomic.Int64
 }
 
 type teamModelRateLimit struct {
@@ -825,6 +842,12 @@ func (s *Service) selectSchedulableEligibleMediaRouteWithQuotaMode(ctx context.C
 }
 
 func (s *Service) createResponseAt(ctx context.Context, input Input, path string) (*Result, error) {
+	// Quality probe traffic carries one explicit marker: the egress layer
+	// derives its probe permissions from the context, and the quality-guard
+	// pass-through decisions below read the Input flag.
+	if input.QualityProbe {
+		ctx = infraegress.WithQualityProbe(ctx)
+	}
 	ctx, egressTrace := infraegress.WithTrace(ctx)
 	startedAt := time.Now()
 	var firstToken *firstTokenTimer
@@ -1019,7 +1042,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	failureFingerprints := make(map[string]int)
 	authRecoveryAttempted := make(map[uint64]bool)
 	holdCfg := s.qualityRetryConfig()
-	qualityHoldEnabled := shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
+	qualityHoldEnabled := s.qualityGuardRuntimeEnabled() && shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
 	// Count accounts that actually reached the upstream. Credential-only skips
 	// do not consume the quality retry budget; refreshes stay on the same account.
 	qualityAccountAttempts := 0
@@ -1199,6 +1222,8 @@ attemptLoop:
 		selectionStarted := time.Now()
 		if ownership != nil {
 			lease, err = s.selector.AcquirePinnedForKey(ctx, route.Provider, ownership.AccountID, route.ID, route.UpstreamModel, quotaMode, true, accountScope)
+		} else if input.ForcedAccountID != 0 {
+			lease, err = s.selector.AcquireForKeyOnAccount(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted, accountScope, input.ForcedAccountID, input.ForcedEgressNodeID)
 		} else if input.ForcedEgressNodeID != 0 {
 			lease, err = s.selector.AcquireForKeyOnEgressNode(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted, accountScope, input.ForcedEgressNodeID)
 		} else {

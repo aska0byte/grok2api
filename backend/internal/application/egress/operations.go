@@ -36,6 +36,8 @@ type OperationsRepository interface {
 	UpdateEgressSourceSync(context.Context, uint64, time.Time, time.Time, int, string) error
 	UpsertEgressNodesFromSource(context.Context, uint64, []domain.Node) (int, error)
 	CreateEgressNodes(context.Context, []domain.Node) (int, error)
+	CountEgressNodesByUsage(context.Context, domain.Usage) (int64, error)
+	DeleteOldestEgressNodesByUsage(context.Context, domain.Usage, int64) (int64, error)
 	UpdateEgressNodeProbe(context.Context, uint64, string, domain.ProbeResult) error
 	ListDueEgressNodes(context.Context, time.Time, time.Duration, int) ([]domain.Node, error)
 	GetEgressOperationsConfig(context.Context) (domain.OperationsConfig, error)
@@ -72,12 +74,14 @@ type ImportInput struct {
 	Name            string
 	Scope           domain.Scope
 	AccountCapacity int
+	Usage           domain.Usage
 	Content         string
 }
 
 type ImportResult struct {
 	Imported int
 	Skipped  int
+	Replaced int
 }
 
 type ProbeBatchResult struct {
@@ -92,6 +96,7 @@ type OperationsConfigInput struct {
 	AutoAssignEnabled         bool
 	AutoBalanceEnabled        bool
 	AssignmentIntervalSeconds int
+	ProbeNodeLimit            *int
 	Fallbacks                 map[domain.Scope]FallbackConfigInput
 }
 
@@ -260,6 +265,24 @@ func (s *Service) ImportText(ctx context.Context, input ImportInput) (ImportResu
 	if err != nil {
 		return ImportResult{}, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
+	usage := input.Usage.Normalize()
+	replaced := 0
+	if usage == domain.UsageProbe {
+		limit := operationsProbeNodeLimit(ctx, operations)
+		if limit > 0 {
+			count, countErr := operations.CountEgressNodesByUsage(ctx, usage)
+			if countErr != nil {
+				return ImportResult{}, countErr
+			}
+			if overflow := count + int64(len(entries)) - int64(limit); overflow > 0 {
+				deleted, deleteErr := operations.DeleteOldestEgressNodesByUsage(ctx, usage, overflow)
+				if deleteErr != nil {
+					return ImportResult{}, deleteErr
+				}
+				replaced = int(deleted)
+			}
+		}
+	}
 	nodes := make([]domain.Node, 0, len(entries))
 	for index, entry := range entries {
 		encryptedProxy, encryptErr := s.cipher.Encrypt(entry.ProxyURL)
@@ -267,7 +290,7 @@ func (s *Service) ImportText(ctx context.Context, input ImportInput) (ImportResu
 			return ImportResult{}, encryptErr
 		}
 		nodes = append(nodes, domain.Node{
-			Name: sourceNodeName(input.Name, index), Scope: input.Scope, Enabled: true,
+			Name: sourceNodeName(input.Name, index), Scope: input.Scope, Enabled: true, Usage: usage,
 			AccountCapacity: input.AccountCapacity, EncryptedProxyURL: encryptedProxy, Health: 1,
 			ProbeStatus: domain.ProbeStatusUnknown,
 		})
@@ -276,7 +299,15 @@ func (s *Service) ImportText(ctx context.Context, input ImportInput) (ImportResu
 	if err != nil {
 		return ImportResult{}, err
 	}
-	return ImportResult{Imported: created, Skipped: skipped}, nil
+	return ImportResult{Imported: created, Skipped: skipped, Replaced: replaced}, nil
+}
+
+func operationsProbeNodeLimit(ctx context.Context, operations OperationsRepository) int {
+	config, err := operations.GetEgressOperationsConfig(ctx)
+	if err != nil {
+		return domain.DefaultOperationsConfig().ProbeNodeLimit
+	}
+	return config.ProbeNodeLimit
 }
 
 func (s *Service) TestNode(ctx context.Context, id uint64) (domain.ProbeResult, error) {
@@ -396,6 +427,16 @@ func (s *Service) UpdateOperationsConfig(ctx context.Context, input OperationsCo
 	if err != nil {
 		return domain.OperationsConfig{}, err
 	}
+	probeNodeLimit := current.ProbeNodeLimit
+	if probeNodeLimit <= 0 {
+		probeNodeLimit = domain.DefaultOperationsConfig().ProbeNodeLimit
+	}
+	if input.ProbeNodeLimit != nil {
+		if *input.ProbeNodeLimit < 0 || *input.ProbeNodeLimit > 100000 {
+			return domain.OperationsConfig{}, fmt.Errorf("%w: 临时代理数量上限必须在 0 到 100000 之间", ErrInvalidInput)
+		}
+		probeNodeLimit = *input.ProbeNodeLimit
+	}
 	probeProvider := input.ProbeProvider
 	if probeProvider == "" {
 		probeProvider = current.ProbeProvider.Normalized()
@@ -413,6 +454,7 @@ func (s *Service) UpdateOperationsConfig(ctx context.Context, input OperationsCo
 	saved, err := operations.SaveEgressOperationsConfig(ctx, domain.OperationsConfig{
 		ProbeProvider: probeProvider, ProbeIntervalSeconds: input.ProbeIntervalSeconds, AutoAssignEnabled: input.AutoAssignEnabled,
 		AutoBalanceEnabled: input.AutoBalanceEnabled, AssignmentIntervalSeconds: input.AssignmentIntervalSeconds,
+		ProbeNodeLimit: probeNodeLimit,
 		Fallbacks: fallbacks, UpdatedAt: time.Now().UTC(),
 	})
 	if errors.Is(err, repository.ErrEgressFallbackInUse) {
@@ -463,6 +505,9 @@ func (s *Service) validateFallbacks(ctx context.Context, current domain.Operatio
 }
 
 func (s *Service) validateFixedFallbackNode(scope domain.Scope, node domain.Node, rejectCooldown bool) error {
+	if node.Usage == domain.UsageProbe {
+		return fmt.Errorf("%w: 临时代理不能作为固定回退节点", ErrInvalidInput)
+	}
 	if !domain.SupportsScope(node.Scope, scope) {
 		return fmt.Errorf("%w: 固定回退节点与 %s 作用域不兼容", ErrInvalidInput, scope)
 	}

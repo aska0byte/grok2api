@@ -25,7 +25,7 @@ func TestQualityProbeModelIsPinnedToBuildNamespace(t *testing.T) {
 }
 
 func TestQualityProbeOutputTokensPerSecondMatchesAuditPanel(t *testing.T) {
-	got := qualityProbeOutputTokensPerSecond(1335, 1200, 17320, 17100)
+	got := qualityProbeOutputTokensPerSecond(1335, 1200, 17320, 17100, true)
 	// 17100ms wait vs 220ms tail: use full duration so buffered thinking is
 	// not crushed into the flush window.
 	want := float64(1335) * 1000 / 17320
@@ -37,7 +37,7 @@ func TestQualityProbeOutputTokensPerSecondMatchesAuditPanel(t *testing.T) {
 func TestQualityProbeOutputTokensPerSecondIncludesReasoningTokens(t *testing.T) {
 	// The panel reports completion/output tokens, including reasoning tokens.
 	// 100ms tail after 1000ms wait is a short flush, so the window is duration.
-	got := qualityProbeOutputTokensPerSecond(1050, 1000, 1100, 1000)
+	got := qualityProbeOutputTokensPerSecond(1050, 1000, 1100, 1000, true)
 	want := float64(1050) * 1000 / 1100
 	if got != want {
 		t.Fatalf("output TPS = %v, want %v", got, want)
@@ -45,16 +45,28 @@ func TestQualityProbeOutputTokensPerSecondIncludesReasoningTokens(t *testing.T) 
 }
 
 func TestQualityProbeOutputTokensPerSecondKeepsNormalTail(t *testing.T) {
-	got := qualityProbeOutputTokensPerSecond(200, 0, 2200, 200)
+	got := qualityProbeOutputTokensPerSecond(200, 0, 2200, 200, false)
 	if got != 100 {
 		t.Fatalf("output TPS = %v, want 100", got)
 	}
 }
 
 func TestQualityProbeOutputTokensPerSecondKeepsBurstWithoutReasoning(t *testing.T) {
-	got := qualityProbeOutputTokensPerSecond(2000, 0, 10100, 10000)
+	got := qualityProbeOutputTokensPerSecond(2000, 0, 10100, 10000, false)
 	if got != 20000 {
 		t.Fatalf("output TPS = %v, want 20000", got)
+	}
+}
+
+func TestQualityProbeOutputTokensPerSecondWidensStubOnlyBufferedFlush(t *testing.T) {
+	// 降智 shape: the reasoning-start stub arrives bundled with a buffered
+	// visible dump and usage reports zero reasoning tokens. The stub is
+	// still reasoning evidence, so the window falls back to the full
+	// duration instead of inflating tok/s on the tiny flush tail.
+	got := qualityProbeOutputTokensPerSecond(300, 0, 8300, 7900, true)
+	want := float64(300) * 1000 / 8300
+	if got != want {
+		t.Fatalf("output TPS = %v, want %v", got, want)
 	}
 }
 

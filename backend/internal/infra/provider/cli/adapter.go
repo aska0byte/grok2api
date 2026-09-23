@@ -384,7 +384,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		}
 	}
 	if request.Streaming && isHTTPSuccess(resp.StatusCode) && resp.Body != nil {
-		resp.Body = wrapBuildSemanticIdle(resp.Body, a.config().StreamIdleTimeout)
+		resp.Body = wrapBuildSemanticIdle(resp.Body, effectiveStreamIdleTimeout(a.config().StreamIdleTimeout, ctx))
 	}
 	modelCatalogChanged := a.modelCatalogChanged(request.Credential.ID, resp.Header.Get("x-models-etag"))
 	// Capture or clear reasoning replay in the upstream Responses shape before protocol conversion.

@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient, type UseMutationResult } from "@tanstack/react-query";
-import { Activity, AlertTriangle, BarChart3, Bot, Coins, Eye, Gauge, MoreHorizontal, Pencil, Plus, Power, PowerOff, RefreshCw, RotateCcw, RotateCw, Shield, ShieldCheck, ShieldX, TimerReset, Trash2, Zap } from "lucide-react";
+import { Activity, AlertTriangle, BarChart3, Bot, Coins, Eye, Gauge, Link2, MoreHorizontal, Pencil, Plus, Power, PowerOff, RefreshCw, RotateCcw, RotateCw, Shield, ShieldCheck, ShieldX, TimerReset, Trash2, Zap } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { useTranslation } from "react-i18next";
@@ -21,10 +21,13 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DegradeAccountsPanel } from "@/features/quality-guard/degrade-accounts-panel";
 import { ProbeProfilesPanel } from "@/features/quality-guard/probe-profiles-panel";
+import { ProbeSamplesPanel } from "@/features/quality-guard/probe-samples-panel";
 import { getQualityGuardStatus, runQualityTest, updateQualityGuardPolicy, type QualityGuardEvent, type QualityGuardNodeState, type QualityGuardPolicy, type QualityGuardStatistics, type QualityGuardStatus, type QualityTestResult } from "@/features/quality-guard/quality-guard-api";
-import { createEgressNode, deleteEgressNodes, listAllEgressNodes, updateEgressNode, updateEgressNodesEnabled, type EgressNodeDTO, type EgressNodeInput } from "@/features/settings/settings-api";
+import { createEgressNode, deleteEgressNodes, listAllEgressNodes, updateEgressNode, updateEgressNodesEnabled, type EgressNodeDTO, type EgressNodeInput, type EgressRebalanceResultDTO } from "@/features/settings/settings-api";
+import { NodeAccountsDialog, RebalanceConfirmDialog, RebalanceResultDialog, useAutoBind, useRebalanceStats } from "@/features/settings/egress-bind-dialogs";
 import { ErrorState } from "@/shared/components/data-state";
 import { PageHeader } from "@/shared/components/page-header";
+import { Pagination } from "@/shared/components/pagination";
 import { cn } from "@/shared/lib/cn";
 
 const NODE_ACTION_TOAST_ID = "quality-guard-node-action";
@@ -38,6 +41,13 @@ export function QualityGuardPage() {
   const [nodeForm, setNodeForm] = useState<EgressNodeInput>(emptyNodeInput());
   const [deletingNodes, setDeletingNodes] = useState<EgressNodeDTO[]>([]);
   const [selectedNodeIDs, setSelectedNodeIDs] = useState<Set<string>>(() => new Set());
+  const [rebalanceConfirmOpen, setRebalanceConfirmOpen] = useState(false);
+  const [rebalanceResult, setRebalanceResult] = useState<EgressRebalanceResultDTO | null>(null);
+  const [accountsNode, setAccountsNode] = useState<EgressNodeDTO | null>(null);
+  const [nodePage, setNodePage] = useState(1);
+  const [nodePageSize, setNodePageSize] = useState(20);
+  const autoBind = useAutoBind((value) => { setRebalanceResult(value); void refreshNodeQueries(); });
+  const autoBindStats = useRebalanceStats(rebalanceConfirmOpen);
   const statusQuery = useQuery({
     queryKey: ["quality-guard"],
     queryFn: getQualityGuardStatus,
@@ -128,16 +138,45 @@ export function QualityGuardPage() {
     setEditingNode(node);
   };
 
+  const guardToggleMutation = useMutation({
+    mutationFn: (next: { enabled: boolean }) => {
+      const current = statusQuery.data;
+      if (!current?.config) return Promise.reject(new Error(t("errors.generic")));
+      return updateQualityGuardPolicy({ ...policyFromStatus(current), enabled: next.enabled });
+    },
+    onSuccess: (_, next) => {
+      toast.success(t(next.enabled ? "qualityGuard.guardEnabledToast" : "qualityGuard.guardDisabledToast"));
+      void queryClient.invalidateQueries({ queryKey: ["quality-guard"] });
+      window.setTimeout(() => void queryClient.invalidateQueries({ queryKey: ["quality-guard"] }), 1_500);
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("errors.generic")),
+  });
+  const guardEnabled = statusQuery.data?.enabled !== false;
+  const toggleGuard = (next: boolean) => {
+    if (!next && !window.confirm(t("qualityGuard.disableGuardConfirm"))) return;
+    guardToggleMutation.mutate({ enabled: next });
+  };
+
   const refresh = () => void Promise.all([statusQuery.refetch(), nodesQuery.refetch()]);
   if (statusQuery.isError && !statusQuery.data) return <ErrorState message={statusQuery.error.message} onRetry={refresh} />;
 
   const status = statusQuery.data;
   const nodes = nodesQuery.data?.items ?? [];
   const protectedNodeIDs = new Set(status?.protectedNodeIds ?? []);
-  const selectableNodes = nodes.filter((node) => !protectedNodeIDs.has(node.id));
-  const selectedNodes = selectableNodes.filter((node) => selectedNodeIDs.has(node.id));
-  const allNodesSelected = selectableNodes.length > 0 && selectedNodes.length === selectableNodes.length;
-  const toggleAllNodes = (checked: boolean) => setSelectedNodeIDs(checked ? new Set(selectableNodes.map((node) => node.id)) : new Set());
+  const nodePageCount = Math.max(1, Math.ceil(nodes.length / nodePageSize));
+  const currentNodePage = Math.min(nodePage, nodePageCount);
+  const pagedNodes = nodes.slice((currentNodePage - 1) * nodePageSize, currentNodePage * nodePageSize);
+  const selectableNodes = pagedNodes.filter((node) => !protectedNodeIDs.has(node.id));
+  const selectedNodes = nodes.filter((node) => selectedNodeIDs.has(node.id) && !protectedNodeIDs.has(node.id));
+  const allNodesSelected = selectableNodes.length > 0 && selectableNodes.every((node) => selectedNodeIDs.has(node.id));
+  const toggleAllNodes = (checked: boolean) => setSelectedNodeIDs((current) => {
+    const next = new Set(current);
+    for (const node of selectableNodes) {
+      if (checked) next.add(node.id);
+      else next.delete(node.id);
+    }
+    return next;
+  });
   const toggleSelectedNode = (node: EgressNodeDTO, checked: boolean) => setSelectedNodeIDs((current) => {
     const next = new Set(current);
     if (checked) next.add(node.id);
@@ -155,21 +194,42 @@ export function QualityGuardPage() {
         title={t("qualityGuard.title")}
         description={t("qualityGuard.description")}
         actions={(
-          <Button variant="secondary" size="sm" onClick={refresh} disabled={statusQuery.isFetching || nodesQuery.isFetching}>
-            <RefreshCw className={cn((statusQuery.isFetching || nodesQuery.isFetching) && "animate-spin")} />
-            {t("common.refresh")}
-          </Button>
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-2 text-sm">
+              <span className={cn("text-muted-foreground", !guardEnabled && "font-medium text-destructive")}>{t("qualityGuard.enabled")}</span>
+              <Switch
+                checked={guardEnabled}
+                disabled={guardToggleMutation.isPending || !statusQuery.data?.available}
+                onCheckedChange={toggleGuard}
+                aria-label={t("qualityGuard.enabled")}
+              />
+            </label>
+            <Button variant="secondary" size="sm" onClick={refresh} disabled={statusQuery.isFetching || nodesQuery.isFetching}>
+              <RefreshCw className={cn((statusQuery.isFetching || nodesQuery.isFetching) && "animate-spin")} />
+              {t("common.refresh")}
+            </Button>
+          </div>
         )}
       />
+
+      {statusQuery.data?.available && statusQuery.data.enabled === false ? (
+        <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {t("qualityGuard.disabledBanner")}
+        </div>
+      ) : null}
 
       <Tabs defaultValue="nodes">
         <TabsList>
           <TabsTrigger value="nodes">{t("qualityGuard.nodesTab")}</TabsTrigger>
           <TabsTrigger value="profiles">{t("qualityGuard.profilesTab")}</TabsTrigger>
+          <TabsTrigger value="samples">{t("qualityGuard.samples.tab")}</TabsTrigger>
           <TabsTrigger value="accounts">{t("qualityGuard.degrade.tab")}</TabsTrigger>
         </TabsList>
         <TabsContent value="profiles" className="mt-6">
           <ProbeProfilesPanel />
+        </TabsContent>
+        <TabsContent value="samples" className="mt-6">
+          <ProbeSamplesPanel />
         </TabsContent>
         <TabsContent value="accounts" className="mt-6">
           <DegradeAccountsPanel
@@ -206,6 +266,7 @@ export function QualityGuardPage() {
                   <Button type="button" variant="secondary" size="sm" className="bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive" disabled={deleteNodeMutation.isPending} onClick={() => setDeletingNodes(selectedNodes)}><Trash2 />{t("common.delete")}</Button>
                 </> : null}
                 <Button type="button" variant="ghost" size="icon" className="size-8" onClick={() => void nodesQuery.refetch()} disabled={nodesQuery.isFetching} aria-label={t("qualityGuard.refreshNodes")} title={t("qualityGuard.refreshNodes")}><RefreshCw className={cn("size-4", nodesQuery.isFetching && "animate-spin")} /></Button>
+                <Button type="button" size="sm" variant="secondary" disabled={autoBind.isPending} onClick={() => setRebalanceConfirmOpen(true)}><Link2 />{t("settings.egress.autoBind")}</Button>
                 <Button type="button" size="sm" onClick={openCreateNode}><Plus />{t("settings.egress.add")}</Button>
               </div>
             </div>
@@ -219,10 +280,15 @@ export function QualityGuardPage() {
                   <TableHead>{t("qualityGuard.lastObserved")}</TableHead><TableHead className="w-48 text-right">{t("common.actions")}</TableHead>
                 </TableRow></TableHeader>
                 <TableBody>
-                  {nodes.map((node) => <NodeRow key={node.id} node={node} protectedNode={protectedNodeIDs.has(node.id)} selected={selectedNodeIDs.has(node.id)} onSelect={(checked) => toggleSelectedNode(node, checked)} state={manualResults[node.id] ?? guardedNodes[node.id]} locale={i18n.language} status={status} testMutation={testMutation} toggleMutation={toggleNodeMutation} onEdit={openEditNode} onDelete={(value) => setDeletingNodes([value])} />)}
+                  {pagedNodes.map((node) => <NodeRow key={node.id} node={node} protectedNode={protectedNodeIDs.has(node.id)} selected={selectedNodeIDs.has(node.id)} onSelect={(checked) => toggleSelectedNode(node, checked)} state={manualResults[node.id] ?? guardedNodes[node.id]} locale={i18n.language} status={status} testMutation={testMutation} toggleMutation={toggleNodeMutation} onEdit={openEditNode} onDelete={(value) => setDeletingNodes([value])} onShowAccounts={(value) => setAccountsNode(value)} />)}
                 </TableBody>
               </Table>
             </div>
+            {nodes.length > 0 ? (
+              <div className="border-t px-4 py-2 sm:px-5">
+                <Pagination page={currentNodePage} pageSize={nodePageSize} total={nodes.length} onPageChange={setNodePage} onPageSizeChange={(value) => { setNodePageSize(value); setNodePage(1); }} pageSizeOptions={[20, 50, 100]} />
+              </div>
+            ) : null}
           </section>
 
           <div className="grid gap-3 xl:grid-cols-[minmax(0,3fr)_minmax(300px,2fr)]">
@@ -243,6 +309,18 @@ export function QualityGuardPage() {
               </AlertDialogFooter>
             </AlertDialogContent>
           </AlertDialog>
+          <RebalanceConfirmDialog
+            open={rebalanceConfirmOpen}
+            onOpenChange={setRebalanceConfirmOpen}
+            stats={autoBindStats.stats}
+            isLoading={autoBindStats.isLoading}
+            isError={autoBindStats.isError}
+            onRetry={autoBindStats.refetch}
+            pending={autoBind.isPending}
+            onConfirm={() => autoBind.mutate()}
+          />
+          <RebalanceResultDialog result={rebalanceResult} onClose={() => setRebalanceResult(null)} />
+          <NodeAccountsDialog node={accountsNode} onOpenChange={(open) => { if (!open) setAccountsNode(null); }} />
         </>
       )}
         </TabsContent>
@@ -284,7 +362,7 @@ function Metric({ icon: Icon, label, value, tone }: { icon: typeof Activity; lab
   </div>;
 }
 
-function NodeRow({ node, protectedNode, selected, onSelect, state, locale, status, testMutation, toggleMutation, onEdit, onDelete }: { node: EgressNodeDTO; protectedNode: boolean; selected: boolean; onSelect: (checked: boolean) => void; state?: QualityGuardNodeState; locale: string; status: QualityGuardStatus; testMutation: UseMutationResult<QualityTestResult, Error, { nodeId: string; status: QualityGuardStatus }>; toggleMutation: UseMutationResult<{ updated: number }, Error, { node: EgressNodeDTO; enabled: boolean }>; onEdit: (node: EgressNodeDTO) => void; onDelete: (node: EgressNodeDTO) => void }) {
+function NodeRow({ node, protectedNode, selected, onSelect, state, locale, status, testMutation, toggleMutation, onEdit, onDelete, onShowAccounts }: { node: EgressNodeDTO; protectedNode: boolean; selected: boolean; onSelect: (checked: boolean) => void; state?: QualityGuardNodeState; locale: string; status: QualityGuardStatus; testMutation: UseMutationResult<QualityTestResult, Error, { nodeId: string; status: QualityGuardStatus }>; toggleMutation: UseMutationResult<{ updated: number }, Error, { node: EgressNodeDTO; enabled: boolean }>; onEdit: (node: EgressNodeDTO) => void; onDelete: (node: EgressNodeDTO) => void; onShowAccounts: (node: EgressNodeDTO) => void }) {
   const { t } = useTranslation();
   const testing = testMutation.isPending && testMutation.variables?.nodeId === node.id;
   const toggling = toggleMutation.isPending && toggleMutation.variables?.node.id === node.id;
@@ -293,7 +371,7 @@ function NodeRow({ node, protectedNode, selected, onSelect, state, locale, statu
     <TableCell className="px-3"><Checkbox checked={selected} disabled={protectedNode} onCheckedChange={(checked) => onSelect(checked === true)} aria-label={t("common.selectItem", { name: node.name })} /></TableCell>
     <TableCell><div className="font-medium">{node.name}</div><div className="mt-0.5 text-[11px] text-muted-foreground">ID {node.id}</div></TableCell>
     <TableCell><StateBadge node={node} state={state} protectedNode={protectedNode} /></TableCell>
-    <TableCell className="text-right text-xs tabular-nums"><span className="font-medium">{node.assignedAccountCount}</span>{node.accountCapacity > 0 ? <span className="text-muted-foreground"> / {node.accountCapacity}</span> : null}</TableCell>
+    <TableCell className="text-right text-xs tabular-nums"><button type="button" className="font-medium underline-offset-2 hover:underline" onClick={() => onShowAccounts(node)}>{node.assignedAccountCount}</button>{node.accountCapacity > 0 ? <span className="text-muted-foreground"> / {node.accountCapacity}</span> : null}</TableCell>
     <TableCell className={cn("text-right font-mono text-xs tabular-nums", classification === "hard" && "font-medium text-destructive", classification === "soft" && "text-amber-600 dark:text-amber-400")}>{state?.last_observed_at ? formatTPS(state.last_output_tps) : "-"}</TableCell>
     <TableCell className="text-right font-mono text-xs tabular-nums">{state?.last_first_token_ms ? `${state.last_first_token_ms} ms` : "-"}</TableCell>
     <TableCell className="text-xs text-muted-foreground">{state?.last_source ? t(`qualityGuard.sources.${state.last_source}`) : "-"}</TableCell>
@@ -457,11 +535,19 @@ function PolicyEditor({ open, onOpenChange, status }: { open: boolean; onOpenCha
 
   const setMode = (value: QualityGuardPolicy["mode"]) => form.setValue("mode", value, { shouldDirty: true, shouldValidate: true });
   const resetDefaults = () => form.reset({ ...DEFAULT_POLICY, minHealthyNodes: Math.min(DEFAULT_POLICY.minHealthyNodes, nodeCount) });
+  const [guardEnabled, setGuardEnabled] = useState(status.enabled !== false);
 
   return <Dialog open={open} onOpenChange={onOpenChange}>
     <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-2xl">
       <DialogHeader><DialogTitle>{t("qualityGuard.editPolicyTitle")}</DialogTitle><DialogDescription>{t("qualityGuard.editPolicyDescription")}</DialogDescription></DialogHeader>
-      <form className="space-y-5" onSubmit={form.handleSubmit((value) => mutation.mutate(value))}>
+      <form className="space-y-5" onSubmit={form.handleSubmit((value) => mutation.mutate({ ...value, enabled: guardEnabled }))}>
+        <div className="flex items-center justify-between gap-4 rounded-md border p-3">
+          <div>
+            <Label htmlFor="guard-enabled" className="font-medium">{t("qualityGuard.enabled")}</Label>
+            <p className="mt-0.5 text-xs text-muted-foreground">{t("qualityGuard.enabledHelp")}</p>
+          </div>
+          <Switch id="guard-enabled" checked={guardEnabled} onCheckedChange={setGuardEnabled} />
+        </div>
         <div className="space-y-2">
           <Label>{t("qualityGuard.mode")}</Label>
           <div role="radiogroup" aria-label={t("qualityGuard.mode")} className="grid grid-cols-3 rounded-md bg-secondary p-1">

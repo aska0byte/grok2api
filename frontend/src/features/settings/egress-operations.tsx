@@ -67,7 +67,7 @@ function defaultFallbacks(): Record<EgressScope, EgressFallbackConfigDTO> {
 }
 
 const defaultOperationsForm: Omit<EgressOperationsConfigDTO, "updatedAt"> = {
-  probeProvider: "cloudflare", probeIntervalSeconds: 900, autoAssignEnabled: false, autoBalanceEnabled: false, assignmentIntervalSeconds: 300, fallbacks: defaultFallbacks(),
+  probeProvider: "cloudflare", probeIntervalSeconds: 900, autoAssignEnabled: false, autoBalanceEnabled: false, assignmentIntervalSeconds: 300, probeNodeLimit: 100, fallbacks: defaultFallbacks(),
 };
 
 function operationsFormFrom(value?: EgressOperationsConfigDTO): Omit<EgressOperationsConfigDTO, "updatedAt"> {
@@ -80,6 +80,7 @@ function operationsFormFrom(value?: EgressOperationsConfigDTO): Omit<EgressOpera
     autoAssignEnabled: value.autoAssignEnabled,
     autoBalanceEnabled: value.autoBalanceEnabled,
     assignmentIntervalSeconds: value.assignmentIntervalSeconds,
+    probeNodeLimit: value.probeNodeLimit,
     fallbacks: {
       grok_build: { ...defaults.grok_build, ...value.fallbacks.grok_build },
       grok_web: { ...defaults.grok_web, ...value.fallbacks.grok_web },
@@ -184,6 +185,9 @@ export function EgressAutomation({ scopeLabel }: { scopeLabel: (scope: EgressSco
             </AutomationRow>
             <AutomationRow controlId="egress-assignment-interval" label={t("settings.egress.assignmentInterval")} description={t("settings.egress.assignmentIntervalHelp")}>
               <IntervalInput id="egress-assignment-interval" value={operationsForm.assignmentIntervalSeconds} unit={t("settings.units.seconds")} onChange={(assignmentIntervalSeconds) => setOperationsDraft({ ...operationsForm, assignmentIntervalSeconds })} />
+            </AutomationRow>
+            <AutomationRow controlId="egress-probe-node-limit" label={t("settings.egress.probeNodeLimit")} description={t("settings.egress.probeNodeLimitHelp")}>
+              <Input id="egress-probe-node-limit" className="h-8 w-28" type="number" min={0} max={100000} value={operationsForm.probeNodeLimit ?? 0} onChange={(event) => setOperationsDraft({ ...operationsForm, probeNodeLimit: Number(event.target.value) })} />
             </AutomationRow>
             <AutomationRow controlId="egress-auto-assign" label={t("settings.egress.autoAssign")} description={t("settings.egress.autoAssignHelp")}>
               <div className="flex h-8 items-center"><Switch id="egress-auto-assign" checked={operationsForm.autoAssignEnabled} onCheckedChange={(autoAssignEnabled) => setOperationsDraft({ ...operationsForm, autoAssignEnabled })} /></div>

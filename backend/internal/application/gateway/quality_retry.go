@@ -276,7 +276,10 @@ func CommitQualityHold(verdict QualityVerdict, qualityAttempt, maxAttempts int, 
 }
 
 func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwnership, route modeldomain.Route, operation audit.Operation, cfg QualityRetryRuntime) bool {
-	if !cfg.Enabled || !input.Streaming || input.ForcedEgressNodeID != 0 || ownership != nil || input.skipQualityHold {
+	// Probe traffic must never be intercepted by its own guard: the explicit
+	// Input flag is the primary exemption (ForcedEgressNodeID remains as a
+	// defensive secondary signal).
+	if !cfg.Enabled || !input.Streaming || input.QualityProbe || input.ForcedEgressNodeID != 0 || ownership != nil || input.skipQualityHold {
 		return false
 	}
 	switch operation {

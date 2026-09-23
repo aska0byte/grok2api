@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, ChevronLeft, ChevronRight, ChevronsUpDown, CircleAlert, CircleHelp, Eye, EyeOff, MoreHorizontal, Network, Pencil, Plus, Power, PowerOff, RefreshCw, Search, Trash2, Upload } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, ChevronsUpDown, CircleAlert, CircleHelp, Eye, EyeOff, Link2, MoreHorizontal, Network, Pencil, Plus, Power, PowerOff, RefreshCw, Search, Trash2, Upload } from "lucide-react";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -17,11 +17,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EgressAutomation, EgressSources } from "@/features/settings/egress-operations";
+import { NodeAccountsDialog, RebalanceConfirmDialog, RebalanceResultDialog, useAutoBind, useRebalanceStats } from "@/features/settings/egress-bind-dialogs";
 import { EgressProxyProfiles } from "@/features/settings/egress-proxy-profiles";
-import { cleanupUnhealthyEgressNodes, createEgressNode, deleteEgressNode, deleteEgressNodes, getEgressNodeProxyURL, getEgressProxyProfile, importEgressText, listEgressProxyProfiles, listEgressNodes, previewUnhealthyEgressNodes, refreshEgressClearance, testEgressNode, updateEgressNode, updateEgressNodesEnabled, type ClearanceMode, type EgressIPProbeDTO, type EgressNodeDTO, type EgressNodeInput, type EgressScope } from "@/features/settings/settings-api";
+import { cleanupUnhealthyEgressNodes, createEgressNode, deleteEgressNode, deleteEgressNodes, getEgressNodeProxyURL, getEgressProxyProfile, importEgressText, listEgressProxyProfiles, listEgressNodes, previewUnhealthyEgressNodes, refreshEgressClearance, testEgressNode, updateEgressNode, updateEgressNodesEnabled, type ClearanceMode, type EgressIPProbeDTO, type EgressNodeDTO, type EgressNodeInput, type EgressRebalanceResultDTO, type EgressScope, type EgressUsage } from "@/features/settings/settings-api";
 import { ErrorState, TableLoadingRow } from "@/shared/components/data-state";
 import { DataTableShell } from "@/shared/components/data-table-shell";
 import { DataTableFilters } from "@/shared/components/data-table-filters";
@@ -32,13 +34,14 @@ import { useDebouncedValue } from "@/shared/hooks/use-debounced-value";
 import { cn } from "@/shared/lib/cn";
 import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/table-sort";
 
-const emptyInput: EgressNodeInput = { name: "", scope: "grok_build", enabled: true, proxyPool: false, accountCapacity: 0, proxyURL: "", userAgent: "", cloudflareCookies: "" };
-type ImportForm = { name: string; scope: EgressScope; accountCapacity: number; content: string };
-const emptyImport: ImportForm = { name: "", scope: "grok_build", accountCapacity: 0, content: "" };
+const emptyInput: EgressNodeInput = { name: "", scope: "grok_build", enabled: true, usage: "production", proxyPool: false, accountCapacity: 0, proxyURL: "", userAgent: "", cloudflareCookies: "" };
+type ImportForm = { name: string; scope: EgressScope; accountCapacity: number; usage: EgressUsage; content: string };
+const emptyImport: ImportForm = { name: "", scope: "grok_build", accountCapacity: 0, usage: "production", content: "" };
 
 export function EgressNodes({ title, clearanceMode }: { title: string; clearanceMode: ClearanceMode }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const [tab, setTab] = useState<EgressUsage>("production");
   const [editing, setEditing] = useState<EgressNodeDTO | null | undefined>(undefined);
   const [proxyVisible, setProxyVisible] = useState(false);
   const [revealedProxyURL, setRevealedProxyURL] = useState("");
@@ -56,13 +59,16 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
   const [selected, setSelected] = useState<Map<string, EgressNodeDTO>>(() => new Map());
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
   const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [rebalanceConfirmOpen, setRebalanceConfirmOpen] = useState(false);
+  const [rebalanceResult, setRebalanceResult] = useState<EgressRebalanceResultDTO | null>(null);
+  const [accountsNode, setAccountsNode] = useState<EgressNodeDTO | null>(null);
   const [profileLibraryOpen, setProfileLibraryOpen] = useState(false);
   const [profileLibraryCreate, setProfileLibraryCreate] = useState(false);
   const debouncedSearch = useDebouncedValue(search);
   const query = useQuery({
-    queryKey: ["egress-nodes", "page", page, pageSize, debouncedSearch, scopeFilter, enabledFilter, probeFilter, assignmentFilter, sort.field, sort.order],
+    queryKey: ["egress-nodes", "page", tab, page, pageSize, debouncedSearch, scopeFilter, enabledFilter, probeFilter, assignmentFilter, sort.field, sort.order],
     queryFn: () => listEgressNodes({
-      page, pageSize, search: debouncedSearch, scope: scopeFilter as EgressScope | "", enabled: enabledFilter,
+      page, pageSize, search: debouncedSearch, scope: scopeFilter as EgressScope | "", enabled: enabledFilter, usage: tab,
       probe: probeFilter, assignment: assignmentFilter, sortBy: sort.field || undefined, sortOrder: sort.field ? sort.order : undefined,
     }),
     staleTime: 15_000,
@@ -96,9 +102,11 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
   });
   const importText = useMutation({
     mutationFn: () => importEgressText(importForm),
-    onSuccess: (value) => { void queryClient.invalidateQueries({ queryKey: ["egress-nodes"] }); setImportOpen(false); toast.success(t("settings.egress.imported", value)); },
+    onSuccess: (value) => { void queryClient.invalidateQueries({ queryKey: ["egress-nodes"] }); setImportOpen(false); toast.success(t("settings.egress.imported", { imported: value.imported, skipped: value.skipped, replaced: value.replaced })); },
     onError: (error) => showError(error, t("settings.egress.operationFailed")),
   });
+  const autoBind = useAutoBind((value) => { setRebalanceResult(value); });
+  const autoBindStats = useRebalanceStats(rebalanceConfirmOpen);
   const remove = useMutation({
     mutationFn: deleteEgressNode,
     onSuccess: (_, id) => {
@@ -168,7 +176,7 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
   });
 
   function openCreate() {
-    setForm(emptyInput);
+    setForm({ ...emptyInput, usage: tab });
     setProxyVisible(false);
     setRevealedProxyURL("");
     setEditing(null);
@@ -181,7 +189,7 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
   }
 
   function openEdit(node: EgressNodeDTO) {
-    setForm({ name: node.name, scope: node.scope, enabled: node.enabled, proxyPool: node.proxyPool, accountCapacity: node.accountCapacity, proxyProfileId: node.proxyProfileId, userAgent: node.scope === "grok_build" ? "" : node.userAgent, proxyURL: "", cloudflareCookies: "" });
+    setForm({ name: node.name, scope: node.scope, enabled: node.enabled, usage: node.usage, proxyPool: node.proxyPool, accountCapacity: node.accountCapacity, proxyProfileId: node.proxyProfileId, userAgent: node.scope === "grok_build" ? "" : node.userAgent, proxyURL: "", cloudflareCookies: "" });
     setProxyVisible(false);
     setRevealedProxyURL("");
     setEditing(node);
@@ -245,8 +253,19 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
       <EgressSources scopeLabel={scopeLabel} />
 
       <section className="space-y-3">
-        <div className="flex min-h-8 items-center px-1">
+        <div className="flex min-h-8 flex-wrap items-center justify-between gap-2 px-1">
           <h2 className="text-sm font-medium tracking-tight">{title}</h2>
+          <div className="flex items-center gap-2">
+            {tab === "production" ? (
+              <Button type="button" size="sm" variant="secondary" disabled={autoBind.isPending} onClick={() => setRebalanceConfirmOpen(true)}><Link2 />{t("settings.egress.autoBind")}</Button>
+            ) : null}
+            <Tabs value={tab} onValueChange={(value) => { setTab(value as EgressUsage); setPage(1); setSelected(new Map()); }}>
+              <TabsList>
+                <TabsTrigger value="production">{t("settings.egress.tabLongTerm")}</TabsTrigger>
+                <TabsTrigger value="probe">{t("settings.egress.tabTemporary")}</TabsTrigger>
+              </TabsList>
+            </Tabs>
+          </div>
         </div>
         <DataTableShell
           toolbar={(
@@ -295,13 +314,13 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
                   <DropdownMenuTrigger asChild><Button type="button" size="sm" variant="secondary"><Plus />{t("settings.egress.add")}</Button></DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
                     <DropdownMenuItem onClick={openCreate}><Plus />{t("settings.egress.addManually")}</DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => { setImportForm(emptyImport); setImportOpen(true); }}><Upload />{t("settings.egress.importText")}</DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => { setImportForm({ ...emptyImport, usage: tab }); setImportOpen(true); }}><Upload />{t("settings.egress.importText")}</DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
             </>
           )}
-          footer={query.data && query.data.total > 0 ? <Pagination page={query.data.page} pageSize={query.data.pageSize} total={query.data.total} onPageChange={setPage} onPageSizeChange={(value) => { setPageSize(value); setPage(1); }} /> : undefined}
+          footer={query.data && query.data.total > 0 ? <Pagination page={query.data.page} pageSize={query.data.pageSize} total={query.data.total} onPageChange={setPage} onPageSizeChange={(value) => { setPageSize(value); setPage(1); }} pageSizeOptions={[20, 50, 100]} /> : undefined}
         >
           {query.isError ? <ErrorState message={query.error.message} onRetry={() => void query.refetch()} /> : null}
           {!query.isError ? <Table viewportRows={10} rowHeight={48} className="min-w-[920px] table-fixed">
@@ -318,12 +337,15 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
                     {node.lastError ? <ErrorTooltip message={node.lastError} /> : null}
                   </div>
                 </TableCell>
-                <TableCell className="text-center"><Badge variant="secondary" className="text-[10px]">{scopeLabel(node.scope)}</Badge></TableCell>
+                <TableCell className="text-center"><div className="flex items-center justify-center gap-1"><Badge variant="secondary" className="text-[10px]">{scopeLabel(node.scope)}</Badge>{node.usage === "probe" ? <Badge variant="outline" className="text-[10px] text-amber-600">{t("settings.egress.usageProbe")}</Badge> : null}</div></TableCell>
                 <TableCell>
                   {node.proxyConfigured ? <div className="min-w-0" title={`${node.proxyDisplay || t("settings.egress.configured")} · ${node.proxyProfileName || node.proxyFingerprint || ""}`}><p className="truncate text-xs font-medium">{node.proxyDisplay || t("settings.egress.configured")}</p>{node.proxyProfileId ? <p className="truncate text-[10px] text-muted-foreground">{node.proxyProfileName || `#${node.proxyFingerprint}`}</p> : node.proxyFingerprint ? <p className="font-mono text-[10px] text-muted-foreground">#{node.proxyFingerprint}</p> : null}</div> : <Badge variant="outline" className="text-[10px] text-muted-foreground">{t("settings.egress.direct")}</Badge>}
                 </TableCell>
                 <TableCell className="text-center"><ClearanceBadge node={node} clearanceMode={clearanceMode} /></TableCell>
-                <TableCell className="text-center text-xs tabular-nums"><span className="font-medium">{node.assignedAccountCount}</span>{node.accountCapacity > 0 ? <span className="text-muted-foreground"> / {node.accountCapacity}</span> : null}</TableCell>
+                <TableCell className="text-center text-xs tabular-nums">
+                  <button type="button" className="font-medium underline-offset-2 hover:underline" onClick={() => setAccountsNode(node)} title={t("settings.egress.nodeAccountsTitle", { name: node.name })}>{node.assignedAccountCount}</button>
+                  {node.accountCapacity > 0 ? <span className="text-muted-foreground"> / {node.accountCapacity}</span> : null}
+                </TableCell>
                 <TableCell><HealthMeter value={node.health} /></TableCell>
                 <TableCell><ProbeSummary node={node} /></TableCell>
                 <TableActionCell>
@@ -346,6 +368,19 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
       </section>
 
       <EgressAutomation scopeLabel={scopeLabel} />
+
+      <RebalanceConfirmDialog
+        open={rebalanceConfirmOpen}
+        onOpenChange={setRebalanceConfirmOpen}
+        stats={autoBindStats.stats}
+        isLoading={autoBindStats.isLoading}
+        isError={autoBindStats.isError}
+        onRetry={autoBindStats.refetch}
+        pending={autoBind.isPending}
+        onConfirm={() => autoBind.mutate()}
+      />
+      <RebalanceResultDialog result={rebalanceResult} onClose={() => setRebalanceResult(null)} />
+      <NodeAccountsDialog node={accountsNode} onOpenChange={(open) => { if (!open) setAccountsNode(null); }} />
 
       <AlertDialog open={batchDeleteOpen} onOpenChange={setBatchDeleteOpen}>
         <AlertDialogContent>
@@ -411,6 +446,15 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
             </div>
             <Field label={t("settings.egress.name")} controlId="egress-name">
               <Input id="egress-name" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
+            </Field>
+            <Field label={t("settings.egress.usage")} controlId="egress-usage" help={editing ? t("settings.egress.usageFixedHelp") : t("settings.egress.usageHelp")}>
+              <Select value={form.usage ?? "production"} onValueChange={(value) => setForm({ ...form, usage: value as EgressUsage })} disabled={Boolean(editing)}>
+                <SelectTrigger id="egress-usage"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="production">{t("settings.egress.usageProduction")}</SelectItem>
+                  <SelectItem value="probe">{t("settings.egress.usageProbe")}</SelectItem>
+                </SelectContent>
+              </Select>
             </Field>
             <Field label={t("settings.egress.capacity")} controlId="egress-capacity">
               <Input id="egress-capacity" type="number" min={0} max={100000} placeholder={t("settings.egress.unlimited")} value={form.accountCapacity || ""} onChange={(event) => setForm({ ...form, accountCapacity: Number(event.target.value) })} />
@@ -485,6 +529,17 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
           <form className="space-y-3.5" onSubmit={(event) => { event.preventDefault(); event.stopPropagation(); importText.mutate(); }}>
             <div className="grid gap-3 sm:grid-cols-2">
               <Field label={t("settings.egress.name")} controlId="egress-import-name"><Input id="egress-import-name" value={importForm.name} onChange={(event) => setImportForm({ ...importForm, name: event.target.value })} /></Field>
+              <Field label={t("settings.egress.usage")} controlId="egress-import-usage">
+                <Select value={importForm.usage} onValueChange={(value) => setImportForm({ ...importForm, usage: value as EgressUsage })}>
+                  <SelectTrigger id="egress-import-usage"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="production">{t("settings.egress.usageProduction")}</SelectItem>
+                    <SelectItem value="probe">{t("settings.egress.usageProbe")}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
               <Field label={t("settings.egress.scope")} controlId="egress-import-scope">
                 <Select value={importForm.scope} onValueChange={(value) => setImportForm({ ...importForm, scope: value as EgressScope })}>
                   <SelectTrigger id="egress-import-scope"><SelectValue /></SelectTrigger>
@@ -497,8 +552,8 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
                   </SelectContent>
                 </Select>
               </Field>
+              <Field label={t("settings.egress.capacity")} controlId="egress-import-capacity"><Input id="egress-import-capacity" type="number" min={0} max={100000} placeholder={t("settings.egress.unlimited")} value={importForm.accountCapacity || ""} onChange={(event) => setImportForm({ ...importForm, accountCapacity: Number(event.target.value) })} /></Field>
             </div>
-            <Field label={t("settings.egress.capacity")} controlId="egress-import-capacity"><Input id="egress-import-capacity" type="number" min={0} max={100000} placeholder={t("settings.egress.unlimited")} value={importForm.accountCapacity || ""} onChange={(event) => setImportForm({ ...importForm, accountCapacity: Number(event.target.value) })} /></Field>
             <Field label={t("settings.egress.proxyList")} controlId="egress-import-list"><Textarea className="min-h-52 font-mono text-xs" id="egress-import-list" value={importForm.content} onChange={(event) => setImportForm({ ...importForm, content: event.target.value })} /></Field>
             <DialogFooter><Button type="button" size="sm" variant="secondary" onClick={() => setImportOpen(false)}>{t("common.cancel")}</Button><Button type="submit" size="sm" disabled={!importForm.name.trim() || !importForm.content.trim() || importText.isPending}>{importText.isPending ? <Spinner /> : null}{t("settings.egress.importText")}</Button></DialogFooter>
           </form>

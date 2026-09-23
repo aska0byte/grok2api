@@ -90,6 +90,7 @@ import {
 import { AccountQuota, ConsoleQuota, WebQuota } from "@/features/accounts/account-quota";
 import { AccountNameCell } from "@/features/accounts/account-name-cell";
 import { WebAccountScriptsDialog } from "@/features/accounts/web-account-scripts";
+import { QualityProbeDialog } from "@/features/accounts/quality-probe-dialog";
 import { WebAccountSettingsDialogs, WebAccountSettingsMenu, type WebAccountConfirmationTarget } from "@/features/accounts/web-account-settings";
 import { assignEgressAccounts, listAllEgressNodes, listEgressNodes, listEgressSources, unassignEgressAccounts, type EgressScope } from "@/features/settings/settings-api";
 
@@ -166,6 +167,8 @@ export function AccountsPage() {
   const [exportCompletedCount, setExportCompletedCount] = useState(0);
   const [syncAllOpen, setSyncAllOpen] = useState(false);
   const [detectDialogOpen, setDetectDialogOpen] = useState(false);
+  const [qualityProbeOpen, setQualityProbeOpen] = useState(false);
+  const [qualityProbeMode, setQualityProbeMode] = useState<"selected" | "all">("selected");
   const [detectMode, setDetectMode] = useState<"selected" | "all">("all");
   const [allQuotaTask, setAllQuotaTask] = useState<BuildQuotaTask>("sync");
   const [quotaSyncProgress, setQuotaSyncProgress] = useState<AccountTaskProgressDTO | null>(null);
@@ -319,6 +322,12 @@ export function AccountsPage() {
     void queryClient.invalidateQueries({ queryKey: ["accounts"] });
     void queryClient.invalidateQueries({ queryKey: ["accounts", "summary"] });
   }, [queryClient]);
+
+  // 探测结果会改变降智面板的 missing_thinking 状态，两处数据都要刷新。
+  const invalidateProbeResults = useCallback(() => {
+    invalidateAccountData();
+    void queryClient.invalidateQueries({ queryKey: ["quality-guard-degrade-accounts"] });
+  }, [invalidateAccountData, queryClient]);
 
   const updateMutation = useMutation({
     mutationFn: (values: AccountForm) => {
@@ -1435,6 +1444,7 @@ export function AccountsPage() {
                 {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConversion([...selected])}>{t("accountConversion.action")}</Button> : null}
                 {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setWebAccountScriptsTargets([...selected])}>{t("webAccountScripts.action")}</Button> : null}
                 {provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openDetectDialog("selected")}>{t("accountCredential.detectAction")}</Button> : null}
+                {provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => { setQualityProbeMode("selected"); setQualityProbeOpen(true); }}>{t("accounts.qualityProbeSelected")}</Button> : null}
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => {
                   if (provider === "grok_build") {
                     setBatchQuotaTask("sync");
@@ -1451,6 +1461,7 @@ export function AccountsPage() {
                 {provider === "grok_web" && hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConversion("all")}>{t("accountConversion.action")}</Button> : null}
                 {provider === "grok_web" && hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setWebAccountScriptsTargets("all")}>{t("webAccountScripts.action")}</Button> : null}
                 {hasProviderAccounts && provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openDetectDialog("all")}>{t("accountCredential.detectAction")}</Button> : null}
+                {hasProviderAccounts && provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => { if (selected.size > 0) { setQualityProbeMode("selected"); } else { setQualityProbeMode("all"); } setQualityProbeOpen(true); }}>{t("accounts.qualityProbeAll")}</Button> : null}
                 {hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => { setAllQuotaTask("sync"); setSyncAllOpen(true); }}>{t("accountCredential.quotaSyncAction")}</Button> : null}
                 {hasProviderAccounts && provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setRenewAllOpen(true)}>{t("accountCredential.refreshAction")}</Button> : null}
                 {hasProviderAccounts ? <Button variant="secondary" size="sm" className="bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive" disabled={bulkTaskPending} onClick={() => { resetCleanupState(); setCleanupOpen(true); }}><Trash2 />{t("accounts.cleanupAction")}</Button> : null}
@@ -1596,6 +1607,15 @@ export function AccountsPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <QualityProbeDialog
+        open={qualityProbeOpen}
+        onOpenChange={setQualityProbeOpen}
+        mode={qualityProbeMode}
+        selectedIds={qualityProbeMode === "selected" ? [...selected] : undefined}
+        filters={qualityProbeMode === "all" ? { search: debouncedSearch, type: typeFilter, status: statusFilter, egress: egressFilter } : undefined}
+        onInvalidate={invalidateProbeResults}
+      />
 
       <Dialog open={detectDialogOpen} onOpenChange={closeDetectDialog}>
         <DialogContent className="max-w-xl gap-4 sm:max-w-2xl">

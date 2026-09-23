@@ -11,6 +11,7 @@ export type QualityGuardPolicy = {
   consecutiveErrors: number;
   quarantineSeconds: number;
   minHealthyNodes: number;
+  enabled?: boolean;
 };
 
 export type QualityGuardNodeState = {
@@ -79,6 +80,7 @@ export type ProbeProfile = {
 export type QualityGuardStatus = {
   available: boolean;
   editable?: boolean;
+  enabled?: boolean;
   startedAt?: number;
   updatedAt?: number;
   lastActiveCycleAt?: number;
@@ -155,7 +157,7 @@ const decodeStatus = (value: unknown): QualityGuardStatus => {
     return value as QualityGuardStatus;
   }
   return createObjectDecoder<QualityGuardStatus>("quality guard", {
-    available: isBoolean, editable: isOptional(isBoolean), startedAt: isNumber, updatedAt: isNumber, lastActiveCycleAt: isNumber,
+    available: isBoolean, editable: isOptional(isBoolean), enabled: isOptional(isBoolean), startedAt: isNumber, updatedAt: isNumber, lastActiveCycleAt: isNumber,
     lastPassivePollAt: isNumber, activeProfileId: isOptional(isString),
     profiles: isOptional(isArrayOf(hasShape({
       id: isString, name: isString, built_in: isBoolean, match_mode: isString, has_expected: isBoolean,

@@ -511,6 +511,7 @@ type egressNodeModel struct {
 	Scope                       string  `gorm:"size:32;not null;check:chk_egress_nodes_specific_scope,scope IN ('grok_build','grok_web','grok_console','grok_web_asset','grok_console_asset')"`
 	Enabled                     bool    `gorm:"not null;default:true"`
 	ProxyPool                   bool    `gorm:"not null;default:false"`
+	Usage                       string  `gorm:"column:usage;size:16;not null;default:production;check:chk_egress_nodes_usage,usage IN ('production','probe')"`
 	SourceID                    *uint64 `gorm:"uniqueIndex:uidx_egress_nodes_source_key,priority:1;index:idx_egress_nodes_source;constraint:OnUpdate:CASCADE,OnDelete:SET NULL"`
 	SourceKey                   string  `gorm:"size:64;not null;default:'';uniqueIndex:uidx_egress_nodes_source_key,priority:2;check:chk_egress_nodes_source_key,length(source_key) <= 64"`
 	AccountCapacity             int     `gorm:"not null;default:0;check:chk_egress_nodes_capacity,account_capacity BETWEEN 0 AND 100000"`
@@ -556,6 +557,7 @@ type egressOperationsConfigModel struct {
 	AutoAssignEnabled                   bool      `gorm:"not null;default:false"`
 	AutoBalanceEnabled                  bool      `gorm:"not null;default:false"`
 	AssignmentIntervalSeconds           int       `gorm:"not null;default:300;check:chk_egress_operations_config_assignment_interval,assignment_interval_seconds BETWEEN 60 AND 86400"`
+	ProbeNodeLimit                      int       `gorm:"not null;default:100;check:chk_egress_operations_config_probe_node_limit,probe_node_limit >= 0"`
 	SubscriptionProxyMigrationCompleted bool      `gorm:"not null;default:false"`
 	ProxyProfileMigrationCompleted      bool      `gorm:"not null;default:false"`
 	BuildFallbackMode                   string    `gorm:"size:16;not null;default:none"`
@@ -572,3 +574,33 @@ type egressOperationsConfigModel struct {
 }
 
 func (egressOperationsConfigModel) TableName() string { return "egress_operations_config" }
+
+type qualityProbeSampleModel struct {
+	ID                    uint64    `gorm:"primaryKey;autoIncrement"`
+	RequestID             string    `gorm:"size:64;not null;uniqueIndex:uidx_probe_samples_request_id;check:chk_probe_samples_request_id,length(request_id) BETWEEN 1 AND 64"`
+	Source                string    `gorm:"size:16;not null;check:chk_probe_samples_source,source IN ('manual','scheduled')"`
+	Round                 int       `gorm:"not null;check:chk_probe_samples_round,round IN (1,2)"`
+	Kind                  string    `gorm:"size:16;not null;default:'text';check:chk_probe_samples_kind,kind IN ('text','html')"`
+	AccountID             uint64    `gorm:"not null;check:chk_probe_samples_account_id,account_id > 0"`
+	AccountName           string    `gorm:"size:160;not null;default:'';check:chk_probe_samples_account_name,length(account_name) <= 160"`
+	EgressNodeID          uint64    `gorm:"not null;default:0;check:chk_probe_samples_node_id,egress_node_id >= 0"`
+	EgressNodeName        string    `gorm:"size:160;not null;default:'';check:chk_probe_samples_node_name,length(egress_node_name) <= 160"`
+	Model                 string    `gorm:"size:255;not null;default:'';check:chk_probe_samples_model,length(model) <= 255"`
+	Classification        string    `gorm:"size:16;not null;check:chk_probe_samples_classification,classification IN ('passed','missing','confirmed','overturned')"`
+	Action                string    `gorm:"size:16;not null;default:'';check:chk_probe_samples_action,action IN ('','cooled','disabled')"`
+	ManualFlag            string    `gorm:"size:16;not null;default:'';check:chk_probe_samples_manual_flag,manual_flag IN ('','suspected','normal')"`
+	MissingThinking       bool      `gorm:"not null;default:false"`
+	ThinkingObserved      bool      `gorm:"not null;default:false"`
+	VisibleText           string    `gorm:"type:text;not null;default:'';check:chk_probe_samples_visible,length(visible_text) <= 65536"`
+	VisibleTruncated      bool      `gorm:"not null;default:false"`
+	ReasoningText         string    `gorm:"type:text;not null;default:'';check:chk_probe_samples_reasoning,length(reasoning_text) <= 65536"`
+	ReasoningTruncated    bool      `gorm:"not null;default:false"`
+	OutputTokens          int64     `gorm:"not null;default:0;check:chk_probe_samples_tokens,output_tokens >= 0 AND reasoning_tokens >= 0 AND first_token_ms >= 0 AND duration_ms >= 0"`
+	ReasoningTokens       int64     `gorm:"not null;default:0"`
+	FirstTokenMS          int64     `gorm:"not null;default:0"`
+	DurationMS            int64     `gorm:"not null;default:0"`
+	OutputTokensPerSecond float64   `gorm:"not null;default:0;check:chk_probe_samples_tps,output_tokens_per_second >= 0"`
+	CreatedAt             time.Time `gorm:"not null"`
+}
+
+func (qualityProbeSampleModel) TableName() string { return "quality_probe_samples" }
