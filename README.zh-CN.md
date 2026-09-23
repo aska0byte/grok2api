@@ -24,7 +24,64 @@
 > 推荐个人新项目 [DEEIX-AI / DEEIX-Chat](https://github.com/DEEIX-AI/DEEIX-Chat)：面向多模型路由、对话、文件、工具、计费与运维的一体化轻量 AI 平台。
 
 > [!NOTE]
-> **本 fork（lij768423-svg/grok2api）对齐 18183 lab。** 默认打开 `qualityGuard` + `requestRetry`（hold 30s、假思考 12h 冷却、空流 15m），`docker compose up -d` 会带上质量守护 sidecar。镜像：[`ghcr.io/lij768423-svg/grok2api:v3.1.4-lab`](https://github.com/lij768423-svg/grok2api/pkgs/container/grok2api)。往上游提 PR 请从官方 `v3.1.4` 开分支，不要带这些 lab 默认。
+> **本 fork（lij768423-svg/grok2api）开箱即用。** 基于官方最新，默认打开 `qualityGuard` + `requestRetry`。当前 lab 版 **v3.1.9-lab**，详见下面「本次更新」。`docker compose up -d --build` 会带上质量守护 sidecar。不要 pull `ghcr.io/chenyme/grok2api:latest`（官方同参数但默认不拦截）。上游：[chenyme#1013](https://github.com/chenyme/grok2api/pull/1013) floor，[chenyme#1015](https://github.com/chenyme/grok2api/pull/1015) TUI hold — 不要带 fork 的 `enabled: true`。
+
+## 本次更新（v3.1.9-lab）
+
+相对 **v3.1.8-lab**。镜像：`ghcr.io/lij768423-svg/grok2api:v3.1.9-lab`、`ghcr.io/lij768423-svg/grok2api-quality-guard:v3.1.9-lab`（`latest` 会跟上）。
+
+`grok-4.7` 成为一等对话模型。价格和推理档位与 `grok-4.6` 相同：500k 上下文，文本和图片进、文本出，`low` / `medium` / `high` / `xhigh`。Console 内置 `Console/grok-4.7`。已经暴露 `grok-4.6` 或 `grok-4.7` 的 Build 账号会保留 `grok-4.6` 和 `grok-4.5`，稀疏 `/models` 还停在 4.6 时补上 `grok-4.7`。质量守护默认仍是 `grok-4.6`；要探测 4.7 把 `qualityGuard.model` 改成 `grok-4.7`。
+
+## 本次更新（v3.1.8-lab）
+
+相对 **v3.1.7-lab**。镜像：`ghcr.io/lij768423-svg/grok2api:v3.1.8-lab`、`ghcr.io/lij768423-svg/grok2api-quality-guard:v3.1.8-lab`（`latest` 已跟上）。
+
+v3.1.7 已经扣假加密（无明文 reasoning）、cipher-only 等 2s、Codex MCP 根 union。18183 上仍漏约 1/7 成功流：vis&lt;8 的 1ms 倒灌、明文思考一票放行、chat 用 `usage.completion` 把思考账单算成正文。
+
+### 1. 假加密/burst 不再要求 `visible >= minOutput`
+
+`reasoning_tokens ≥ 80` **或** 密文达地板，且可见生成窗 `&lt;2s` → 扣。chat 可见 1–7 token、账单 2000+ reasoning 的 1ms 倒完会换号。
+
+### 2. 明文思考不再一票放行
+
+有 reasoning/summary delta，但 `VisibleFlushMS &lt; 2s` 且 `reasoning_tokens / output ≥ 0.8` → 仍扣。慢流真思考（flush ≥2s，或 reasoning 占比不到 80%）照常过。
+
+### 3. 可见字只数流式 content
+
+chat / Responses 只数 `delta.content` / `output_text` / message。不再用 `usage.output − usage.reasoning` 抬可见字——chat 的 completion 经常仍含思考，倒灌会被当成长答案。
+
+## 一键安装提示词
+
+整段复制发给你的 AI，只改最后的家宽：
+
+```text
+按这个文档装，不要发挥：
+https://github.com/lij768423-svg/grok2api/blob/main/AI_GROK2API_INSTALL.md
+
+主路径：lij768423-svg/grok2api（fork）+ Quality Guard sidecar。不要装 CPA。
+不要 pull ghcr.io/chenyme/grok2api:latest，必须 clone 本 fork 再 docker compose up -d --build。
+
+这个 fork 开箱即用：官方最新 + 缺思考拦截默认开。
+- hold 30s / minOutput 8 / 6 枪 / fail_closed
+- 短 encrypted_content stub 不算思考；floor = max(256B, reasoning_tokens×4)
+- hold 到期后的短问候 + 高 reasoning（「你好」）继续扣
+- 假加密思考（无明文 reasoning、<2s 整段刷出）扣住；cipher-only 等 2s
+- vis&lt;8 / 明文倒灌：flush &lt;2s 且 reasoning/output ≥ 0.8 仍扣
+- 可见字只数流式 content（不用 usage completion − reasoning）
+- Codex MCP 根 anyOf/oneOf schema 转发前改成宽松 object
+- 缺思考冷却 12h，空流 15m；docker compose up -d 带 sidecar
+
+家宽全部用上，每个 sticky 一个 Mihomo listener + 一个 Grok2API 节点。
+禁止只开 1 个交差。禁止把多条合成一个「住宅池」。
+
+机器：Linux + Docker，装到 ~/grok-stack（新目录，别覆盖现网）。
+有邮箱再一起装注册机；没有也行，先把出口和 Guard 拉起来。
+
+家宽（一行一条，URL / host:port:user:pass / 带 sid 都行）：
+
+```
+
+完整步骤：[AI_GROK2API_INSTALL.md](./AI_GROK2API_INSTALL.md)。家宽脚本：[`scripts/from_residential.py`](./scripts/from_residential.py)。
 
 > [!NOTE]
 > 本项目仅供技术研究与学习交流。使用时请务必遵循 Grok 官方的使用条款及当地法律法规，否则一切后果自负！
@@ -35,8 +92,12 @@
 
 <table>
 <tr>
-<td width="200" align="center" valign="middle"><a href="https://www.krill-ai.com/register?invite=KJ2VGIRVAE"><img src="https://raw.githubusercontent.com/Krill-ai-org/krill-ai-static/refs/heads/main/krill-logo/Eng/250x150.png" alt="Krill AI" width="160"></a></td>
-<td valign="middle">感谢 Krill AI 赞助了本项目！Krill 提供 GPT / Claude / Gemini / 多款国产模型的官方稳定极速的 API 中转服务，支持企业级定制、报销开票、7×16h 专属技术支持。更有独家适配的 WebSocket 连接，畅享极速首字速度。Krill 为本项目提供了特别优惠，使用<a href="https://www.krill-ai.com/register?invite=KJ2VGIRVAE">此链接</a>注册并在下订单时填写「grok2api」优惠码，首购套餐可享 Codex 77 折优惠！</td>
+<td width="200" align="center" valign="middle"><a href="https://go.apimart.ai/gh-grok2api"><img src="frontend/public/sponner/api-mart.jpg" alt="APIMart" width="180"></a></td>
+<td valign="middle">感谢 APIMart 赞助了本项目！APIMart 是专注 AI 图片/视频生成的低价 API 平台，GPT-Image-2 低至 $0.006/张，1 美元可出图 160+ 张。图片、视频一套异步 API 通吃，提交任务拿 ID、回调取结果，跑批万张不超时、换模型不改代码。按量付费、无月费，通过此 <a href="https://go.apimart.ai/gh-grok2api">注册链接</a> 注册即可开用。</td>
+</tr>
+<tr>
+<td width="200" align="center" valign="middle"><a href="https://www.packyapi.com/register"><img src="frontend/public/sponner/packycode.png" alt="PackyCode" width="180"></a></td>
+<td valign="middle">PackyCode 是稳定专业的 API 中转服务商，支持 Claude Code、Codex、Gemini 及多种国模，提供统一高速入口、全栈可观测、风控与弹性扩容。<a href="https://www.packyapi.com/register">点此注册</a>，轻松将大模型接入业务流程。</td>
 </tr>
 <tr>
 <td width="200" align="center" valign="middle"><a href="https://github.com/DEEIX-AI/DEEIX-Chat"><img src="frontend/public/sponner/deeix-chat_deeix-ai.png" alt="DEEIX AI / DEEIX Chat" width="160"></a></td>
@@ -249,6 +310,7 @@ Build 不使用全局固定模型清单。账号同步会读取上游 `/models`�
 | 模型 | 类型 | 可用条件 | 网关接口能力 |
 | :-- | :-- | :-- | :-- |
 | 上游 `/models` 返回的对话模型（例如 `grok-4.5`） | 对话 | 当前账号实际返回 | Chat Completions、Responses、Messages、compact、stored response |
+| `grok-4.7` | 对话 | 已经暴露 `grok-4.6` 或 `grok-4.7` 的 Build 账号 | Chat Completions、Responses、Messages；稀疏目录仍停在 `grok-4.6` 时网关补齐。`grok-4.6` 和 `grok-4.5` 继续保留。effort：low / medium / high / xhigh |
 | `grok-composer-2.5-fast` | 对话 | Grok Build OAuth 账号 | Chat Completions、Responses、Messages；即使上游稀疏目录暂未列出，网关也会按 OAuth 会话能力补齐 |
 | `grok-imagine-video-1.5` | 视频 | Super/付费 Build 账号 | Videos；Free 或能力未知账号不会获得该路由 |
 
@@ -278,6 +340,7 @@ Console 使用当前版本内置目录。对话为无状态转发；图片、视
 | `grok-4.20-0309-non-reasoning` | 对话 | Chat Completions、Responses、Messages |
 | `grok-4.20-0309-reasoning` | 对话 | Chat Completions、Responses、Messages；模型会推理，但上游不接受可配置 `reasoningEffort` |
 | `grok-4.20-multi-agent-0309` | 对话 | Chat Completions、Responses、Messages |
+| `grok-4.7` | 对话 | Chat Completions、Responses、Messages；effort 为 low / medium / high / xhigh |
 | `grok-4.5` | 对话 | Chat Completions、Responses、Messages |
 | `grok-4.3` | 对话 | Chat Completions、Responses、Messages |
 | `grok-build-0.1` | 对话 | Chat Completions、Responses、Messages |
@@ -354,6 +417,7 @@ curl http://127.0.0.1:8000/v1/responses \
 - 代理池模式，单次连接失败不会触发全局冷却
 - 固定代理传输失败后立即复测；同节点复测自动合并，后续绑定请求限时等待并在恢复后快速重试
 - [出口质量守护程序](./tools/egress-quality-guard/README.zh-CN.md)：逐节点模型探测、防误杀隔离和自动恢复；`docker compose up -d` 默认启动 sidecar（passive）
+- 代理用户名包含 `{account}` 的节点会被识别为租约级节点：被动审计异常只会临时移出对应的账号租约，冷却后固定使用同一账号和节点复测，复测异常会续期；若 sidecar 不可用，已到期的隔离不会继续阻断路由，避免孤儿状态永久卡住账号。共享节点始终不会因此停用，也不会暴露渲染后的代理身份。普通固定 sticky 会话仍可按独立节点管理
 - 固定 sticky 会话应各自建成独立节点（`proxyPool=false`）。不要把多条 sticky 合成一个节点，否则质量守护只能整组摘流，无法定位坏会话
 
 Hysteria 与 TUIC 暂未支持。FlareSolverr 仅接受 HTTP/SOCKS 代理地址，因此自动刷新 Clearance 暂不能直接使用隧道分享链接。
@@ -365,8 +429,8 @@ qualityGuard:
   enabled: true
   model: "grok-4.6"
   # 思考模型缺流式 reasoning 时先扣住响应，换号再打，不把降智正文发给用户。
-  # grok-4.6 的 encrypted thinking 在流末尾，hold 必须 30s；3s 会误判成
-  # missing-thinking，审计出现 200 · 错误。
+  # 最多观察 30 秒；stub 加上足够可见输出在超时后扣住（TUI 30s 后的短问候），
+  # 空 stub 继续等。floor 已达标但 1 秒内吐短回复的也扣。
   requestRetry:
     enabled: true
     maxAttempts: 6
@@ -377,7 +441,7 @@ qualityGuard:
     idleAccountCooldown: 15m
 ```
 
-`requestRetry` 在网关请求路径上生效，与 sidecar 探测/隔离相互独立。示例配置默认开启。开启后，可见输出达到 `minOutputTokens` 且全程无流式 reasoning 时**不发给用户**，排除该账号再试；全部仍无推理则按 `onExhausted` 返回 `503 quality_degraded` 或放出最后一枪。不处理图/视频、stored response 钉账号和 ForcedEgress 探针。Grok TUI 带 tools 的回合仍会 hold，避免 0-thinking 降智流跳过闸门。
+`requestRetry` 在网关请求路径上生效，与 sidecar 探测/隔离相互独立。本 fork 默认开启。可见输出达到 `minOutputTokens` 且全程无流式 reasoning 时**不发给用户**，排除该账号再试。TUI 续聊（`previous_response_id`）和 hosted tools 仍 hold：第一枪钉原账号，扣住后 unpin 换号。不处理图/视频和 ForcedEgress 探针。全部仍无推理则按 `onExhausted` 返回 `503 quality_degraded` 或放出最后一枪。
 
 ```bash
 docker compose up -d

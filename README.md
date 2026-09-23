@@ -24,7 +24,64 @@
 > Check out [DEEIX-AI / DEEIX-Chat](https://github.com/DEEIX-AI/DEEIX-Chat), a lightweight, integrated AI platform for model routing, chat, files, tools, billing, identity, and operations.
 
 > [!NOTE]
-> **This fork (lij768423-svg/grok2api) matches the 18183 lab.** `qualityGuard` and `requestRetry` are on by default (30s hold, 12h missing-thinking cooldown, 15m idle cooldown). `docker compose up -d` starts the quality-guard sidecar. Image: [`ghcr.io/lij768423-svg/grok2api:v3.1.4-lab`](https://github.com/lij768423-svg/grok2api/pkgs/container/grok2api). For upstream PRs, branch from official `v3.1.4` and do not include these lab defaults.
+> **This fork (lij768423-svg/grok2api) is out of the box.** Official latest plus `qualityGuard` / `requestRetry` ON. Current lab release is **v3.1.9-lab** — see What's new below. `docker compose up -d --build` starts the sidecar. Do not pull `ghcr.io/chenyme/grok2api:latest` (same numbers, intercept off). Upstream: [chenyme#1013](https://github.com/chenyme/grok2api/pull/1013) floor, [chenyme#1015](https://github.com/chenyme/grok2api/pull/1015) TUI hold — do not include this fork's `enabled: true`.
+
+## What's new (v3.1.9-lab)
+
+Relative to **v3.1.8-lab**. Images: `ghcr.io/lij768423-svg/grok2api:v3.1.9-lab`, `ghcr.io/lij768423-svg/grok2api-quality-guard:v3.1.9-lab` (`latest` follows).
+
+`grok-4.7` is a first-class conversation model. Same price and effort contract as `grok-4.6`: 500k context, text and image in, text out, `low` / `medium` / `high` / `xhigh`. Console ships `Console/grok-4.7`. A Build account that already exposes `grok-4.6` or `grok-4.7` keeps `grok-4.6` and `grok-4.5`, and gains `grok-4.7` when the sparse `/models` list has not caught up. Quality-guard default stays `grok-4.6`; set `qualityGuard.model: grok-4.7` to probe 4.7.
+
+## What's new (v3.1.8-lab)
+
+Relative to **v3.1.7-lab**. Images: `ghcr.io/lij768423-svg/grok2api:v3.1.8-lab`, `ghcr.io/lij768423-svg/grok2api-quality-guard:v3.1.8-lab` (`latest` follows).
+
+v3.1.7 already withheld fake-enc dumps with no plaintext reasoning, waited 2s on cipher-only, and simplified Codex MCP root unions. On the 18183 lab it still leaked ~1/7 of successful streams: 1ms flushes with `vis<8`, plaintext thinking as a veto, and chat `usage.completion` inflating visible tokens.
+
+### 1. Fast dump no longer needs `visible >= minOutput`
+
+Withhold when `reasoning_tokens ≥ 80` **or** ciphertext meets the floor, **and** the visible flush window is `&lt;2s`. Chat dumps with 1–7 visible tokens and a 2000+ reasoning bill are rotated.
+
+### 2. Plaintext thinking is not a veto on dumps
+
+If streamed reasoning/summary exists but `VisibleFlushMS &lt; 2s` and `reasoning_tokens / output ≥ 0.8`, still withhold. Slow real thinking (flush ≥2s, or reasoning share below 80%) still delivers.
+
+### 3. Visible tokens from streamed content only
+
+Chat and Responses count `delta.content` / `output_text` / message items. Do not lift visible from `usage.output − usage.reasoning` — chat often reports completion tokens that still include reasoning, which made dumps look like long answers.
+
+## One-shot install prompt
+
+Paste this to your AI, then append every residential sticky:
+
+```text
+Follow this doc exactly:
+https://github.com/lij768423-svg/grok2api/blob/main/AI_GROK2API_INSTALL.md
+
+Primary path: lij768423-svg/grok2api (fork) + Quality Guard sidecar. Do not install CPA.
+Do not pull ghcr.io/chenyme/grok2api:latest. Clone this fork and docker compose up -d --build.
+
+This fork is out of the box: official latest + missing-thinking intercept ON.
+- hold 30s / minOutput 8 / 6 attempts / fail_closed
+- short encrypted_content stubs are not thinking; floor = max(256B, reasoning_tokens×4)
+- hold-expired short greeting + high reasoning still withheld
+- fake-enc dump (<2s full-answer flush, no plaintext reasoning) withheld; cipher-only waits 2s
+- vis<8 / plaintext-ratio dumps with flush <2s and reasoning/output ≥ 0.8 withheld
+- visible tokens from streamed content only (not usage completion − reasoning)
+- Codex MCP root anyOf/oneOf schemas simplified for Grok Build
+- 12h missing-thinking cooldown, 15m idle; compose up -d starts the sidecar
+
+Use every residential sticky: one Mihomo listener + one Grok2API node per session.
+A single res-01 node, or merging many stickies into one pool, is not done.
+
+Machine: Linux + Docker, install into ~/grok-stack (new directory).
+Email is optional. Bring the exits and Guard up first.
+
+Residential lines (one per line):
+
+```
+
+Walkthrough: [AI_GROK2API_INSTALL.md](./AI_GROK2API_INSTALL.md). Generator: [`scripts/from_residential.py`](./scripts/from_residential.py).
 
 > [!NOTE]
 > This project is for technical research and learning purposes only. Please comply with Grok's official terms of use and local laws when using it; otherwise, you will be solely responsible for all consequences!
@@ -34,8 +91,12 @@
 
 <table>
 <tr>
-<td width="200" align="center" valign="middle"><a href="https://www.krill-ai.com/register?invite=KJ2VGIRVAE"><img src="https://raw.githubusercontent.com/Krill-ai-org/krill-ai-static/refs/heads/main/krill-logo/Eng/250x150.png" alt="Krill AI" width="160"></a></td>
-<td valign="middle">Krill AI provides fast, stable API access to GPT, Claude, Gemini, and leading Chinese models, with enterprise customization, invoicing, 7×16 support, and optimized WebSocket connections for faster first-token latency. Register through the <a href="https://www.krill-ai.com/register?invite=KJ2VGIRVAE">exclusive link</a> and use code “grok2api” for 23% off your first Codex package.</td>
+<td width="200" align="center" valign="middle"><a href="https://go.apimart.ai/gh-grok2api"><img src="frontend/public/sponner/api-mart.jpg" alt="APIMart" width="180"></a></td>
+<td valign="middle">Thanks to APIMart for sponsoring this project! APIMart is a low-cost API platform for AI image &amp; video generation — GPT-Image-2 from $0.006/image, 160+ images per dollar. One async API covers both image and video: submit a task, get an ID, fetch results via polling or callback. Batch tens of thousands of images without timeouts, switch models without changing code. Pay-as-you-go with no monthly fee — <a href="https://go.apimart.ai/gh-grok2api">sign up here</a> to get started.</td>
+</tr>
+<tr>
+<td width="200" align="center" valign="middle"><a href="https://www.packyapi.com/register"><img src="frontend/public/sponner/packycode.png" alt="PackyCode" width="180"></a></td>
+<td valign="middle">PackyCode is a stable and professional API relay for Claude Code, Codex, Gemini, and leading Chinese models. With fast unified access, full-stack observability, risk controls, elastic scaling, and cost optimization, it delivers a smooth developer experience. <a href="https://www.packyapi.com/register">Sign up here</a> to bring production-ready AI into your workflows.</td>
 </tr>
 <tr>
 <td width="200" align="center" valign="middle"><a href="https://github.com/DEEIX-AI/DEEIX-Chat"><img src="frontend/public/sponner/deeix-chat_deeix-ai.png" alt="DEEIX AI / DEEIX Chat" width="160"></a></td>
@@ -247,6 +308,7 @@ Build does not use one global static model list. Account synchronization reads t
 | Model | Type | Availability | Gateway surfaces |
 | :-- | :-- | :-- | :-- |
 | Conversation models returned by upstream `/models` (for example, `grok-4.5`) | Conversation | Returned by the selected account | Chat Completions, Responses, Messages, compact, stored responses |
+| `grok-4.7` | Conversation | Build accounts that already expose `grok-4.6` or `grok-4.7` | Chat Completions, Responses, Messages; supplemented when a sparse catalog still stops at `grok-4.6`. `grok-4.6` and `grok-4.5` stay available. Effort: low / medium / high / xhigh |
 | `grok-composer-2.5-fast` | Conversation | Grok Build OAuth accounts | Chat Completions, Responses, Messages; supplemented from the OAuth session contract when a sparse upstream catalog omits it |
 | `grok-imagine-video-1.5` | Video | Super/paid Build accounts | Videos; not assigned to Free or unknown-entitlement accounts |
 
@@ -279,6 +341,7 @@ Console uses the catalog built into the current release. Conversation forwarding
 | `grok-4.20-0309-non-reasoning` | Conversation | Chat Completions, Responses, Messages |
 | `grok-4.20-0309-reasoning` | Conversation | Chat Completions, Responses, Messages; the model reasons but the upstream rejects configurable `reasoningEffort` |
 | `grok-4.20-multi-agent-0309` | Conversation | Chat Completions, Responses, Messages |
+| `grok-4.7` | Conversation | Chat Completions, Responses, Messages; effort low / medium / high / xhigh |
 | `grok-4.5` | Conversation | Chat Completions, Responses, Messages |
 | `grok-4.3` | Conversation | Chat Completions, Responses, Messages |
 | `grok-build-0.1` | Conversation | Chat Completions, Responses, Messages |
@@ -355,6 +418,7 @@ Egress nodes are scoped to Build, Web, Console, or Web assets. The admin console
 - Proxy-pool mode without global cooldown after one connection failure
 - Immediate recovery probes after fixed-proxy transport failures, with per-node coalescing and bounded waiting for fast retry
 - [Egress Quality Guard](./tools/egress-quality-guard/README.md) for per-node probes, quarantine, and recovery; `docker compose up -d` starts the sidecar in passive mode
+- Nodes whose proxy username contains `{account}` are treated as lease-scoped: a passive anomaly temporarily removes only the audited account lease, then recovery pins the probe to that same account and node. An unhealthy probe renews the hold; an expired hold no longer blocks routing if the sidecar is unavailable, so stale guard state cannot strand an account indefinitely. The shared node is never disabled and the rendered proxy identity is never exposed. Ordinary fixed sticky sessions can still be managed as separate nodes
 - Give each sticky session its own fixed node (`proxyPool=false`). Do not merge several stickies into one node, or the guard can only quarantine the whole group
 
 Hysteria and TUIC are not supported yet. FlareSolverr accepts only HTTP/SOCKS proxy URLs, so automatic clearance refresh cannot use a tunnel share URL directly.
@@ -366,8 +430,9 @@ qualityGuard:
   enabled: true
   model: "grok-4.6"
   # Withhold thinking-model streams that have no streamed reasoning.
-  # 30s hold is required for grok-4.6 encrypted thinking at end-of-stream;
-  # 3s cuts those as missing-thinking (HTTP 200 · error in audits).
+  # Observe for up to 30s. A stub plus enough visible output at the deadline
+  # is withheld; empty stub-only streams keep waiting. Floor-met dumps that
+  # flush a short greeting in under 1s are also withheld.
   requestRetry:
     enabled: true
     maxAttempts: 6
@@ -378,7 +443,7 @@ qualityGuard:
     idleAccountCooldown: 15m
 ```
 
-`requestRetry` runs on the gateway request path and is independent of the sidecar. The example enables it. When enabled, a thinking-model stream with enough visible output and no streamed reasoning is **not delivered**; another account is tried. If every attempt still has no reasoning, `onExhausted` either returns `503 quality_degraded` or delivers the last body. Image, video, stored-response, and ForcedEgress probe requests are unchanged. Grok TUI tool turns stay held so 0-thinking dumps cannot skip the gate.
+`requestRetry` runs on the gateway request path and is independent of the sidecar. This fork enables it. A thinking-model stream with enough visible output and no streamed reasoning is **not delivered**; another account is tried. TUI follow-ups (`previous_response_id`) and hosted-tool turns stay held — the first attempt stays pinned, a withhold unpins and rotates. Image, video, and ForcedEgress probe requests are unchanged. If every attempt still has no reasoning, `onExhausted` either returns `503 quality_degraded` or delivers the last body.
 
 ```bash
 docker compose up -d

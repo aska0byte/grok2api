@@ -22,6 +22,7 @@ type AuditRepository interface {
 	// least `threshold` distinct egress nodes — the cross-proxy evidence used
 	// to schedule account quality probes.
 	SummarizeCrossProxySuspects(ctx context.Context, start time.Time, threshold, limit int) ([]CrossProxySuspect, error)
+	PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
 // CrossProxySuspect is one account seen failing across multiple egress nodes.
@@ -95,6 +96,7 @@ type DegradeAccount struct {
 	Enabled            bool
 	Found              bool
 	BuildBotFlagSource int
+	LeaseCooldownUntil *time.Time
 	Nodes              []string
 }
 
