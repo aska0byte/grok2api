@@ -16,6 +16,7 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	"github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
 
@@ -250,8 +251,8 @@ func boundWebMediaDiagnostic(value string, limit int) string {
 }
 
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
-	if strings.TrimSpace(request.ImageURL) != "" || len(request.ReferenceURLs) > 0 {
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider"))
+	if len(request.ReferenceAudios) > 0 || strings.TrimSpace(request.VideoURL) != "" {
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 当前仅支持文本与图片生视频；参考音频与视频续写请使用 Console Provider"))
 	}
 	cfg := a.config()
 	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
@@ -272,7 +273,25 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if resolution == "" {
 		resolution = "720p"
 	}
+	assets := make([]string, 0, len(request.ReferenceURLs)+1)
+	if strings.TrimSpace(request.ImageURL) != "" {
+		assetID, uploadErr := a.prepareVideoImageAsset(ctx, cfg, lease, token, request.ImageURL)
+		if uploadErr != nil {
+			return provider.VideoResult{}, uploadErr
+		}
+		assets = append(assets, assetID)
+	}
+	for _, rawReference := range request.ReferenceURLs {
+		assetID, uploadErr := a.prepareVideoImageAsset(ctx, cfg, lease, token, rawReference)
+		if uploadErr != nil {
+			return provider.VideoResult{}, uploadErr
+		}
+		assets = append(assets, assetID)
+	}
 	payload := videoCreatePayload(request.Prompt, ratio, resolution, segments[0])
+	if len(assets) > 0 {
+		payload = videoCreateImageToVideoPayload(request.Prompt, ratio, resolution, segments[0], assets)
+	}
 	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
 	if err != nil {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
@@ -543,4 +562,53 @@ func videoCreatePayload(prompt, ratio, resolution string, seconds int) map[strin
 		},
 		"kind": "CONVERSATION_KIND_IMAGINE",
 	}
+}
+
+// videoCreateImageToVideoPayload mirrors the captured Grok Imagine browser
+// request for image-to-video. The uploaded asset's fileMetadataId goes
+// straight into mediaGenInput.imageToVideo.inputAssets and the legacy media
+// post flow is skipped entirely.
+func videoCreateImageToVideoPayload(prompt, ratio, resolution string, seconds int, inputAssets []string) map[string]any {
+	return map[string]any{
+		"modelName":            "imagine-video-gen",
+		"message":              prompt + " --mode=custom",
+		"enableImageStreaming": true,
+		"enableSideBySide":     true,
+		"sendFinalMetadata":    true,
+		"responseMetadata": map[string]any{
+			"experiments": []any{},
+			"modelConfigOverride": map[string]any{
+				"modelMap": map[string]any{},
+			},
+		},
+		"mediaGenInput": map[string]any{
+			"imageToVideo": map[string]any{
+				"prompt":         prompt,
+				"inputAssets":    inputAssets,
+				"aspectRatio":    ratio,
+				"duration":       seconds,
+				"resolutionName": resolution,
+				"mode":           "custom",
+			},
+		},
+		"kind": "CONVERSATION_KIND_IMAGINE",
+	}
+}
+
+// prepareVideoImageAsset materializes the caller-supplied image (data URI or
+// remote URL) and uploads it through the Imagine V2 direct endpoint. Video
+// generation references the returned fileMetadataId, mirroring image edit.
+func (a *Adapter) prepareVideoImageAsset(ctx context.Context, cfg Config, lease *egress.Lease, token, rawURL string) (string, error) {
+	image, err := a.loadChatImage(ctx, lease, strings.TrimSpace(rawURL), cfg.MaxInputImageBytes)
+	if err != nil {
+		return "", provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
+	}
+	uploaded, err := a.uploadFileV2Direct(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine", imagineSelfUploadSource, "video_image_upload")
+	if err != nil {
+		return "", provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
+	}
+	if uploaded.MetadataID == "" {
+		return "", provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("上传视频输入图片后未返回 fileMetadataId"))
+	}
+	return uploaded.MetadataID, nil
 }
